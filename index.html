@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet PMS Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --ink: #1f2937; --muted: #6b7280;
+    --ok: #16a34a; --soon: #d97706; --overdue: #dc2626; --accent: #2563eb;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg); color: var(--ink); margin: 0; padding: 16px;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; color: #fff;
+  }
+  .badge.OK { background: var(--ok); }
+  .badge.DUE_SOON { background: var(--soon); }
+  .badge.OVERDUE { background: var(--overdue); }
+  .badge.notice { background: var(--accent); }
+  button {
+    font-size: 14px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: #fff; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { background: var(--overdue); color: #fff; border-color: var(--overdue); }
+  button.ghost { background: transparent; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input, select {
+    width: 100%; padding: 10px; margin: 6px 0 12px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 15px;
+  }
+  label { font-size: 13px; color: var(--muted); }
+  .big-num { font-size: 40px; font-weight: 700; text-align: center; margin: 10px 0; }
+  .center { text-align: center; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
+    align-items: center; justify-content: center; z-index: 10; padding: 16px;
+  }
+  .modal { background: #fff; border-radius: 12px; padding: 20px; max-width: 320px; width: 100%; text-align: center; }
+  #qr-canvas-holder { display: flex; justify-content: center; margin: 12px 0; }
+  .err { color: var(--overdue); font-size: 13px; margin-top: 4px; }
+  .toggle-link { color: var(--accent); font-size: 13px; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">Loading…</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
+  query, orderBy, limit, serverTimestamp
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+
+// ============================================================
+// FILL THIS IN after creating your Firebase project
+// (Firebase console → Project settings → General → Your apps → Web app)
+// ============================================================
+const firebaseConfig = {
+  apiKey: "AIzaSyBY_VN44y9NvcIQT7hD2dDJDXaUlkfnfIw",
+  authDomain: "fleet-monitoring-000.firebaseapp.com",
+  projectId: "fleet-monitoring-000",
+  storageBucket: "fleet-monitoring-000.firebasestorage.app",
+  messagingSenderId: "649217389166",
+  appId: "1:649217389166:web:61f5c8b5cc6f6d751b6c7f",
+  measurementId: "G-J11K7M4XXD"
+};
+// ============================================================
+
+const fbApp = initializeApp(firebaseConfig);
+const db = getFirestore(fbApp);
+const auth = getAuth(fbApp);
+
+const DUE_SOON_RATIO = 0.10;
+const params = new URLSearchParams(window.location.search);
+const VEHICLE_ID = params.get('v') || '';
+const WEBAPP_URL = window.location.origin + window.location.pathname;
+const app = document.getElementById('app');
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+  });
+}
+function statusLabel(s) {
+  return s === 'OVERDUE' ? 'Overdue' : s === 'DUE_SOON' ? 'Due Soon' : 'OK';
+}
+function fmtDate(ts) {
+  if (!ts) return '—';
+  var d = ts.toDate ? ts.toDate() : new Date(ts);
+  return isNaN(d) ? '—' : d.toLocaleString();
+}
+function computeStatus(v) {
+  var interval = Number(v.pmsIntervalKm) || 0;
+  var since = Number(v.currentOdometer) - Number(v.lastPMSOdometer);
+  var remaining = interval - since;
+  var status = 'OK';
+  if (interval > 0) {
+    if (remaining <= 0) status = 'OVERDUE';
+    else if (remaining <= interval * DUE_SOON_RATIO) status = 'DUE_SOON';
+  }
+  return { kmSinceLastPMS: since, remaining: remaining, status: status, specialNotice: v.specialNotice || '' };
+}
+
+// ============================================================
+// DATA LAYER (Firestore)
+// ============================================================
+async function listVehicles() {
+  var snap = await getDocs(collection(db, 'vehicles'));
+  return snap.docs.map(function (d) { return Object.assign({ id: d.id }, d.data()); });
+}
+async function getVehicle(id) {
+  var snap = await getDoc(doc(db, 'vehicles', id));
+  return snap.exists() ? Object.assign({ id: snap.id }, snap.data()) : null;
+}
+async function addVehicle(plate, name, pmsIntervalKm, startOdometer) {
+  var odo = Number(startOdometer) || 0;
+  var ref = await addDoc(collection(db, 'vehicles'), {
+    plate: plate, name: name, pmsIntervalKm: Number(pmsIntervalKm) || 0,
+    lastPMSOdometer: odo, lastPMSDate: serverTimestamp(),
+    currentOdometer: odo, lastSubmissionAt: null, lastSubmissionBy: '', specialNotice: ''
+  });
+  return getVehicle(ref.id);
+}
+async function deleteVehicleFn(id) {
+  await deleteDoc(doc(db, 'vehicles', id));
+}
+async function markPMSDone(id) {
+  var v = await getVehicle(id);
+  await updateDoc(doc(db, 'vehicles', id), {
+    lastPMSOdometer: v.currentOdometer, lastPMSDate: serverTimestamp(), specialNotice: ''
+  });
+  return getVehicle(id);
+}
+async function setSpecialNotice(id, text) {
+  await updateDoc(doc(db, 'vehicles', id), { specialNotice: text || '' });
+  return getVehicle(id);
+}
+async function submitReading(vehicleId, odometer, driverName) {
+  odometer = Number(odometer);
+  var v = await getVehicle(vehicleId);
+  var prevOdometer = Number(v.currentOdometer);
+  await addDoc(collection(db, 'vehicles', vehicleId, 'logs'), {
+    odometer: odometer, prevOdometer: prevOdometer, timestamp: serverTimestamp(),
+    driverName: driverName || '', recalled: false
+  });
+  await updateDoc(doc(db, 'vehicles', vehicleId), {
+    currentOdometer: odometer, lastSubmissionAt: serverTimestamp(), lastSubmissionBy: driverName || ''
+  });
+  return getVehicle(vehicleId);
+}
+async function recallLastSubmission(vehicleId) {
+  var q = query(collection(db, 'vehicles', vehicleId, 'logs'), orderBy('timestamp', 'desc'), limit(20));
+  var snap = await getDocs(q);
+  var target = snap.docs.find(function (d) { return d.data().recalled !== true; });
+  if (!target) throw new Error('No submission to recall');
+  await updateDoc(target.ref, { recalled: true });
+  var prevOdo = target.data().prevOdometer;
+  await updateDoc(doc(db, 'vehicles', vehicleId), { currentOdometer: prevOdo });
+  return getVehicle(vehicleId);
+}
+
+// ============================================================
+// AUTH + ROUTER
+// ============================================================
+signInAnonymously(auth).catch(function (err) {
+  app.innerHTML = '<div class="card"><p class="err">Could not connect: ' + esc(err.message) + '</p></div>';
+});
+onAuthStateChanged(auth, function (user) {
+  if (!user) return;
+  if (VEHICLE_ID) {
+    renderDriverLoading();
+    getVehicle(VEHICLE_ID).then(function (v) {
+      v ? renderDriverForm(v) : renderDriverNotFound();
+    }).catch(renderError);
+  } else {
+    renderAdminLoading();
+    loadAdmin();
+  }
+});
+
+// ============================================================
+// DRIVER VIEW
+// ============================================================
+function renderDriverLoading() {
+  app.innerHTML = '<h1>Fleet PMS Tracker</h1><p class="muted">Loading vehicle…</p>';
+}
+function renderDriverNotFound() {
+  app.innerHTML = '<h1>Fleet PMS Tracker</h1><div class="card"><p>This vehicle QR code isn\'t recognized. Please check with your fleet admin.</p></div>';
+}
+function renderError(err) {
+  app.innerHTML = '<div class="card"><p class="err">' + esc(err.message || err) + '</p></div>';
+}
+
+function statusBanner(v) {
+  var p = computeStatus(v);
+  var html = '<div class="row"><span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span>' +
+    '<span class="muted">' + p.kmSinceLastPMS.toLocaleString() + ' km since last PMS</span></div>';
+  if (p.status === 'OVERDUE') {
+    html += '<p class="muted">Overdue by ' + Math.abs(p.remaining).toLocaleString() + ' km.</p>';
+  } else if (p.status === 'DUE_SOON') {
+    html += '<p class="muted">Due in ' + p.remaining.toLocaleString() + ' km.</p>';
+  }
+  if (p.specialNotice) {
+    html += '<p><span class="badge notice">Notice</span> ' + esc(p.specialNotice) + '</p>';
+  }
+  return html;
+}
+
+function renderDriverForm(v) {
+  app.innerHTML =
+    '<h1>' + esc(v.plate) + (v.name ? ' — ' + esc(v.name) : '') + '</h1>' +
+    '<p class="sub">Current recorded odometer: ' + Number(v.currentOdometer).toLocaleString() + ' km</p>' +
+    '<div class="card">' + statusBanner(v) + '</div>' +
+    '<div class="card">' +
+      '<label>New odometer reading (km)</label>' +
+      '<input type="number" id="odo-input" inputmode="numeric" placeholder="e.g. 45210">' +
+      '<label>Driver name (optional)</label>' +
+      '<input type="text" id="name-input" placeholder="Your name">' +
+      '<div id="form-err" class="err"></div>' +
+      '<button class="primary" style="width:100%" id="review-btn">Review &amp; Submit</button>' +
+    '</div>';
+
+  document.getElementById('review-btn').onclick = function () {
+    var odo = document.getElementById('odo-input').value;
+    var name = document.getElementById('name-input').value;
+    var errEl = document.getElementById('form-err');
+    errEl.textContent = '';
+    if (odo === '' || isNaN(odo) || Number(odo) < 0) {
+      errEl.textContent = 'Please enter a valid odometer reading.';
+      return;
+    }
+    var warn = '';
+    if (Number(odo) < Number(v.currentOdometer)) {
+      warn = '<p class="err">Heads up: this is lower than the last recorded reading (' +
+        Number(v.currentOdometer).toLocaleString() + ' km). Double check before submitting.</p>';
+    }
+    renderDriverReview(v, Number(odo), name, warn);
+  };
+}
+
+function renderDriverReview(v, odo, name, warn) {
+  app.innerHTML =
+    '<h1>' + esc(v.plate) + '</h1>' +
+    '<p class="sub">Please review before submitting</p>' +
+    '<div class="card center">' +
+      '<div class="muted">Odometer reading</div>' +
+      '<div class="big-num">' + odo.toLocaleString() + ' km</div>' +
+      (name ? '<div class="muted">Driver: ' + esc(name) + '</div>' : '') +
+      warn +
+    '</div>' +
+    '<div class="actions">' +
+      '<button class="ghost" id="edit-btn">Edit</button>' +
+      '<button class="primary" id="confirm-btn" style="flex:1">Confirm &amp; Submit</button>' +
+    '</div>';
+
+  document.getElementById('edit-btn').onclick = function () { renderDriverForm(v); };
+  document.getElementById('confirm-btn').onclick = function () {
+    var btn = document.getElementById('confirm-btn');
+    btn.disabled = true; btn.textContent = 'Submitting…';
+    submitReading(v.id, odo, name).then(function (updated) {
+      renderDriverConfirmed(updated);
+    }).catch(function (err) {
+      btn.disabled = false; btn.textContent = 'Confirm & Submit';
+      alert('Could not submit: ' + (err.message || err));
+    });
+  };
+}
+
+function renderDriverConfirmed(v) {
+  app.innerHTML =
+    '<h1>' + esc(v.plate) + '</h1>' +
+    '<div class="card center">' +
+      '<div class="muted">Submitted</div>' +
+      '<div class="big-num">' + Number(v.currentOdometer).toLocaleString() + ' km</div>' +
+    '</div>' +
+    '<div class="card">' + statusBanner(v) + '</div>' +
+    '<div class="actions">' +
+      '<button class="danger" id="recall-btn">Recall this submission</button>' +
+      '<button class="primary" id="newsub-btn" style="flex:1">Submit another reading</button>' +
+    '</div>' +
+    '<p class="muted center" style="margin-top:10px">You can close this page now.</p>';
+
+  document.getElementById('newsub-btn').onclick = function () { renderDriverForm(v); };
+  document.getElementById('recall-btn').onclick = function () {
+    if (!confirm('Recall this submission and revert to the previous reading?')) return;
+    recallLastSubmission(v.id).then(function (updated) {
+      alert('Submission recalled.');
+      renderDriverForm(updated);
+    }).catch(function (err) {
+      alert('Could not recall: ' + (err.message || err));
+    });
+  };
+}
+
+// ============================================================
+// ADMIN VIEW
+// ============================================================
+function renderAdminLoading() {
+  app.innerHTML = '<h1>Fleet PMS Dashboard</h1><p class="muted">Loading vehicles…</p>';
+}
+
+function loadAdmin() {
+  listVehicles().then(renderAdmin).catch(renderError);
+}
+
+function renderAdmin(vehicles) {
+  var counts = { OK: 0, DUE_SOON: 0, OVERDUE: 0 };
+  vehicles.forEach(function (v) { counts[computeStatus(v).status]++; });
+
+  var html = '<h1>Fleet PMS Dashboard</h1>' +
+    '<p class="sub">' + vehicles.length + ' vehicle(s) — ' +
+      '<span class="badge OK">OK ' + counts.OK + '</span> ' +
+      '<span class="badge DUE_SOON">Due Soon ' + counts.DUE_SOON + '</span> ' +
+      '<span class="badge OVERDUE">Overdue ' + counts.OVERDUE + '</span></p>';
+
+  html += '<div class="card"><span class="toggle-link" id="add-toggle">+ Add a vehicle</span>' +
+    '<div id="add-form" style="display:none; margin-top:12px">' +
+      '<label>Plate number</label><input id="f-plate">' +
+      '<label>Name / description (optional)</label><input id="f-name">' +
+      '<label>PMS interval (km)</label><input id="f-interval" type="number" value="5000">' +
+      '<label>Starting odometer (km)</label><input id="f-odo" type="number" value="0">' +
+      '<button class="primary" id="f-submit">Add Vehicle</button>' +
+    '</div></div>';
+
+  if (vehicles.length === 0) {
+    html += '<div class="card muted center">No vehicles yet. Add one above to generate its QR code.</div>';
+  }
+
+  vehicles.forEach(function (v) {
+    var p = computeStatus(v);
+    html += '<div class="card">' +
+      '<div class="row">' +
+        '<div><strong>' + esc(v.plate) + '</strong>' + (v.name ? ' <span class="muted">' + esc(v.name) + '</span>' : '') + '</div>' +
+        '<span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span>' +
+      '</div>' +
+      '<p class="muted" style="margin:6px 0">' +
+        'Odometer: ' + Number(v.currentOdometer).toLocaleString() + ' km &middot; ' +
+        p.kmSinceLastPMS.toLocaleString() + ' km since last PMS' +
+        (v.pmsIntervalKm ? ' (interval ' + Number(v.pmsIntervalKm).toLocaleString() + ' km)' : '') +
+      '</p>' +
+      (p.specialNotice ? '<p><span class="badge notice">Notice</span> ' + esc(p.specialNotice) + '</p>' : '') +
+      '<p class="muted" style="margin:2px 0">Last submitted: ' + fmtDate(v.lastSubmissionAt) +
+        (v.lastSubmissionBy ? ' by ' + esc(v.lastSubmissionBy) : '') + '</p>' +
+      '<div class="actions">' +
+        '<button id="qr-' + v.id + '">Show QR</button>' +
+        '<button id="pms-' + v.id + '">Mark PMS Done</button>' +
+        '<button id="notice-' + v.id + '">Set Notice</button>' +
+        '<button class="danger" id="del-' + v.id + '">Delete</button>' +
+      '</div>' +
+    '</div>';
+  });
+
+  app.innerHTML = html;
+
+  document.getElementById('add-toggle').onclick = function () {
+    var f = document.getElementById('add-form');
+    f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  };
+  document.getElementById('f-submit').onclick = function () {
+    var plate = document.getElementById('f-plate').value.trim();
+    if (!plate) { alert('Plate number is required.'); return; }
+    var name = document.getElementById('f-name').value.trim();
+    var interval = document.getElementById('f-interval').value;
+    var odo = document.getElementById('f-odo').value;
+    addVehicle(plate, name, interval, odo).then(loadAdmin).catch(function (err) {
+      alert('Could not add vehicle: ' + (err.message || err));
+    });
+  };
+
+  vehicles.forEach(function (v) {
+    document.getElementById('qr-' + v.id).onclick = function () { showQrModal(v); };
+    document.getElementById('pms-' + v.id).onclick = function () {
+      if (!confirm('Mark PMS as done for ' + v.plate + '? This resets the interval from the current odometer.')) return;
+      markPMSDone(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+    };
+    document.getElementById('notice-' + v.id).onclick = function () {
+      var text = prompt('Notice for ' + v.plate + ' (e.g. "Called in for brake check"). Leave blank to clear.', v.specialNotice || '');
+      if (text === null) return;
+      setSpecialNotice(v.id, text).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+    };
+    document.getElementById('del-' + v.id).onclick = function () {
+      if (!confirm('Delete ' + v.plate + '? This cannot be undone.')) return;
+      deleteVehicleFn(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+    };
+  });
+}
+
+function showQrModal(v) {
+  var url = WEBAPP_URL + '?v=' + encodeURIComponent(v.id);
+  var bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = '<div class="modal">' +
+    '<strong>' + esc(v.plate) + '</strong>' +
+    '<div id="qr-canvas-holder"></div>' +
+    '<p class="muted" style="word-break:break-all">' + esc(url) + '</p>' +
+    '<button class="primary" id="qr-close">Close</button>' +
+  '</div>';
+  document.body.appendChild(bg);
+  new QRCode(document.getElementById('qr-canvas-holder'), { text: url, width: 200, height: 200 });
+  document.getElementById('qr-close').onclick = function () { document.body.removeChild(bg); };
+  bg.onclick = function (e) { if (e.target === bg) document.body.removeChild(bg); };
+}
+</script>
+</body>
+</html>
