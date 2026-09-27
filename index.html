@@ -16,7 +16,7 @@
     font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
     background: var(--bg); color: var(--ink); margin: 0; padding: 16px;
   }
-  .wrap { max-width: 720px; margin: 0 auto; }
+  .wrap { max-width: 980px; margin: 0 auto; }
   h1 { font-size: 20px; margin: 0 0 4px; }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
   .card {
@@ -57,6 +57,25 @@
   #qr-canvas-holder { display: flex; justify-content: center; margin: 12px 0; }
   .err { color: var(--overdue); font-size: 13px; margin-top: 4px; }
   .toggle-link { color: var(--accent); font-size: 13px; cursor: pointer; text-decoration: underline; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .calendar { overflow-x: auto; }
+  .calendar-head, .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(100px, 1fr)); min-width: 700px; }
+  .calendar-head div { padding: 8px; color: var(--muted); font-size: 12px; text-align: center; }
+  .calendar-day { min-height: 76px; border: 1px solid var(--border); padding: 7px; background: #fff; }
+  .calendar-day.empty { background: var(--bg); }
+  .calendar-day.today { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .calendar-day strong { font-size: 13px; }
+  .event { display: block; margin-top: 5px; padding: 3px 5px; border-radius: 5px; background: #dbeafe; color: #1e40af; font-size: 11px; line-height: 1.25; }
+  .file-input { padding: 8px; background: #f9fafb; }
+  .photo-preview { max-width: 100%; max-height: 180px; border-radius: 8px; margin-top: 6px; }
+  .setup-note { background: #eff6ff; border-color: #bfdbfe; }
+  .type-list { margin-top: 16px; }
+  .type-group { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 10px; }
+  .type-group-title { background: #f9fafb; padding: 10px 12px; font-weight: 700; }
+  .equipment-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap: 10px; align-items: center; padding: 11px 12px; border-top: 1px solid var(--border); }
+  .equipment-row small { color: var(--muted); display: block; margin-top: 3px; }
+  @media (max-width: 640px) { .equipment-row { grid-template-columns: 1fr 1fr; } .equipment-row .badge { justify-self: start; } }
+  @media (max-width: 520px) { body { padding: 10px; } .card { padding: 13px; } }
 </style>
 </head>
 <body>
@@ -69,6 +88,7 @@ import {
   query, orderBy, limit, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-storage.js";
 
 // ============================================================
 // FILL THIS IN after creating your Firebase project
@@ -88,8 +108,10 @@ const firebaseConfig = {
 const fbApp = initializeApp(firebaseConfig);
 const db = getFirestore(fbApp);
 const auth = getAuth(fbApp);
+const storage = getStorage(fbApp);
 
 const DUE_SOON_RATIO = 0.10;
+var calendarCursor = new Date();
 const params = new URLSearchParams(window.location.search);
 const VEHICLE_ID = params.get('v') || '';
 const WEBAPP_URL = window.location.origin + window.location.pathname;
@@ -119,6 +141,31 @@ function computeStatus(v) {
   }
   return { kmSinceLastPMS: since, remaining: remaining, status: status, specialNotice: v.specialNotice || '' };
 }
+function equipmentId(v) { return v.equipmentId || v.plate || v.id; }
+function equipmentLabel(v) { return equipmentId(v) + (v.equipmentType ? ' — ' + v.equipmentType : (v.name ? ' — ' + v.name : '')); }
+function dateValue(value) {
+  if (!value) return '';
+  var d = value.toDate ? value.toDate() : new Date(value);
+  return isNaN(d) ? '' : d.toISOString().slice(0, 10);
+}
+function dateKey(value) { return dateValue(value); }
+function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
+function scheduleDate(v) { return v.scheduleMode === 'manual' ? v.nextPMSDate : (v.forecastPMSDate || ''); }
+function localDateKey(date) {
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+}
+function csvCell(value) {
+  var text = String(value == null ? '' : value);
+  if (/^[\s]*[=+\-@\t\r]/.test(text)) text = "'" + text;
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+function downloadCsv(rows, filename) {
+  var csv = '\uFEFF' + rows.map(function (row) { return row.map(csvCell).join(','); }).join('\r\n');
+  var url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  var link = document.createElement('a');
+  link.href = url; link.download = filename; link.click();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+}
 
 // ============================================================
 // DATA LAYER (Firestore)
@@ -131,12 +178,37 @@ async function getVehicle(id) {
   var snap = await getDoc(doc(db, 'vehicles', id));
   return snap.exists() ? Object.assign({ id: snap.id }, snap.data()) : null;
 }
-async function addVehicle(plate, name, pmsIntervalKm, startOdometer) {
-  var odo = Number(startOdometer) || 0;
+async function listReadingLogs(vehicleId) {
+  var snap = await getDocs(query(collection(db, 'vehicles', vehicleId, 'logs'), orderBy('timestamp', 'asc')));
+  return snap.docs.map(function (d) { return Object.assign({ id: d.id }, d.data()); });
+}
+function forecastPMSDate(v, logs) {
+  if (v.scheduleMode === 'manual' && v.nextPMSDate) return v.nextPMSDate;
+  var interval = Number(v.pmsIntervalKm) || 0;
+  var remaining = interval - (Number(v.currentOdometer) - Number(v.lastPMSOdometer));
+  if (interval <= 0 || remaining <= 0) return '';
+  var points = (logs || []).filter(function (log) {
+    return log.recalled !== true && log.timestamp && Number(log.odometer) >= 0;
+  });
+  if (points.length < 2) return '';
+  var first = points[0].timestamp.toDate ? points[0].timestamp.toDate() : new Date(points[0].timestamp);
+  var last = points[points.length - 1].timestamp.toDate ? points[points.length - 1].timestamp.toDate() : new Date(points[points.length - 1].timestamp);
+  var elapsedDays = (last - first) / 86400000;
+  var distance = Number(points[points.length - 1].odometer) - Number(points[0].odometer);
+  if (elapsedDays <= 0 || distance <= 0) return '';
+  var dailyUsage = distance / elapsedDays;
+  var forecast = new Date();
+  forecast.setDate(forecast.getDate() + Math.ceil(remaining / dailyUsage));
+  return forecast.toISOString().slice(0, 10);
+}
+async function addVehicle(id, type, pmsIntervalKm, lastPmsOdometer, currentOdometer, nextPmsDate) {
+  var lastOdo = Number(lastPmsOdometer) || 0;
+  var currentOdo = currentOdometer === '' ? lastOdo : Number(currentOdometer);
   var ref = await addDoc(collection(db, 'vehicles'), {
-    plate: plate, name: name, pmsIntervalKm: Number(pmsIntervalKm) || 0,
-    lastPMSOdometer: odo, lastPMSDate: serverTimestamp(),
-    currentOdometer: odo, lastSubmissionAt: null, lastSubmissionBy: '', specialNotice: ''
+    equipmentId: id, equipmentType: type, pmsIntervalKm: Number(pmsIntervalKm) || 0,
+    lastPMSOdometer: lastOdo, lastPMSDate: serverTimestamp(), nextPMSDate: nextPmsDate || '',
+    scheduleMode: nextPmsDate ? 'manual' : 'auto',
+    currentOdometer: currentOdo, lastSubmissionAt: null, lastSubmissionBy: '', specialNotice: ''
   });
   return getVehicle(ref.id);
 }
@@ -146,7 +218,8 @@ async function deleteVehicleFn(id) {
 async function markPMSDone(id) {
   var v = await getVehicle(id);
   await updateDoc(doc(db, 'vehicles', id), {
-    lastPMSOdometer: v.currentOdometer, lastPMSDate: serverTimestamp(), specialNotice: ''
+    lastPMSOdometer: v.currentOdometer, lastPMSDate: serverTimestamp(), nextPMSDate: '',
+    scheduleMode: 'auto', specialNotice: ''
   });
   return getVehicle(id);
 }
@@ -154,18 +227,39 @@ async function setSpecialNotice(id, text) {
   await updateDoc(doc(db, 'vehicles', id), { specialNotice: text || '' });
   return getVehicle(id);
 }
+async function setNextPMSDate(id, date) {
+  await updateDoc(doc(db, 'vehicles', id), { nextPMSDate: date || '', scheduleMode: date ? 'manual' : 'auto' });
+  return getVehicle(id);
+}
 async function submitReading(vehicleId, odometer, driverName) {
   odometer = Number(odometer);
   var v = await getVehicle(vehicleId);
   var prevOdometer = Number(v.currentOdometer);
-  await addDoc(collection(db, 'vehicles', vehicleId, 'logs'), {
+  var logRef = await addDoc(collection(db, 'vehicles', vehicleId, 'logs'), {
     odometer: odometer, prevOdometer: prevOdometer, timestamp: serverTimestamp(),
-    driverName: driverName || '', recalled: false
+    driverName: driverName || '', photoUrl: '', recalled: false
   });
   await updateDoc(doc(db, 'vehicles', vehicleId), {
     currentOdometer: odometer, lastSubmissionAt: serverTimestamp(), lastSubmissionBy: driverName || ''
   });
-  return getVehicle(vehicleId);
+  var logs = await listReadingLogs(vehicleId);
+  var forecast = forecastPMSDate(await getVehicle(vehicleId), logs);
+  if (forecast) await updateDoc(doc(db, 'vehicles', vehicleId), { forecastPMSDate: forecast });
+  return { vehicle: await getVehicle(vehicleId), logId: logRef.id };
+}
+async function attachReadingPhoto(vehicleId, logId, file) {
+  var path = 'odometer-proofs/' + vehicleId + '/' + logId + '-' + Date.now() + '-' + file.name.replace(/[^a-z0-9._-]/gi, '_');
+  var storageRef = ref(storage, path);
+  await uploadBytes(storageRef, file, { contentType: file.type });
+  var photoUrl = await getDownloadURL(storageRef);
+  await updateDoc(doc(db, 'vehicles', vehicleId, 'logs', logId), { photoUrl: photoUrl });
+  return photoUrl;
+}
+async function sendToSheet(payload) {
+  var url = integrationUrl();
+  if (!url) return;
+  var response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+  if (!response.ok) throw new Error('Sheet sync failed (' + response.status + ').');
 }
 async function recallLastSubmission(vehicleId) {
   var q = query(collection(db, 'vehicles', vehicleId, 'logs'), orderBy('timestamp', 'desc'), limit(20));
@@ -227,7 +321,7 @@ function statusBanner(v) {
 
 function renderDriverForm(v) {
   app.innerHTML =
-    '<h1>' + esc(v.plate) + (v.name ? ' — ' + esc(v.name) : '') + '</h1>' +
+    '<h1>' + esc(equipmentLabel(v)) + '</h1>' +
     '<p class="sub">Current recorded odometer: ' + Number(v.currentOdometer).toLocaleString() + ' km</p>' +
     '<div class="card">' + statusBanner(v) + '</div>' +
     '<div class="card">' +
@@ -235,6 +329,9 @@ function renderDriverForm(v) {
       '<input type="number" id="odo-input" inputmode="numeric" placeholder="e.g. 45210">' +
       '<label>Driver name (optional)</label>' +
       '<input type="text" id="name-input" placeholder="Your name">' +
+      '<label>Photo of odometer/SMR (required proof)</label>' +
+      '<input class="file-input" type="file" id="photo-input" accept="image/*" capture="environment">' +
+      '<img id="photo-preview" class="photo-preview" style="display:none" alt="Odometer proof preview">' +
       '<div id="form-err" class="err"></div>' +
       '<button class="primary" style="width:100%" id="review-btn">Review &amp; Submit</button>' +
     '</div>';
@@ -242,10 +339,15 @@ function renderDriverForm(v) {
   document.getElementById('review-btn').onclick = function () {
     var odo = document.getElementById('odo-input').value;
     var name = document.getElementById('name-input').value;
+    var photo = document.getElementById('photo-input').files[0];
     var errEl = document.getElementById('form-err');
     errEl.textContent = '';
     if (odo === '' || isNaN(odo) || Number(odo) < 0) {
       errEl.textContent = 'Please enter a valid odometer reading.';
+      return;
+    }
+    if (!photo || !photo.type.startsWith('image/')) {
+      errEl.textContent = 'Please take or select a photo of the odometer/SMR reading.';
       return;
     }
     var warn = '';
@@ -253,18 +355,24 @@ function renderDriverForm(v) {
       warn = '<p class="err">Heads up: this is lower than the last recorded reading (' +
         Number(v.currentOdometer).toLocaleString() + ' km). Double check before submitting.</p>';
     }
-    renderDriverReview(v, Number(odo), name, warn);
+    renderDriverReview(v, Number(odo), name, photo, warn);
+  };
+  document.getElementById('photo-input').onchange = function () {
+    var file = this.files[0], preview = document.getElementById('photo-preview');
+    if (!file) { preview.style.display = 'none'; return; }
+    preview.src = URL.createObjectURL(file); preview.style.display = 'block';
   };
 }
 
-function renderDriverReview(v, odo, name, warn) {
+function renderDriverReview(v, odo, name, photo, warn) {
   app.innerHTML =
-    '<h1>' + esc(v.plate) + '</h1>' +
+    '<h1>' + esc(equipmentLabel(v)) + '</h1>' +
     '<p class="sub">Please review before submitting</p>' +
     '<div class="card center">' +
       '<div class="muted">Odometer reading</div>' +
       '<div class="big-num">' + odo.toLocaleString() + ' km</div>' +
       (name ? '<div class="muted">Driver: ' + esc(name) + '</div>' : '') +
+      '<div class="muted">Odometer photo attached: ' + esc(photo.name) + '</div>' +
       warn +
     '</div>' +
     '<div class="actions">' +
@@ -276,7 +384,15 @@ function renderDriverReview(v, odo, name, warn) {
   document.getElementById('confirm-btn').onclick = function () {
     var btn = document.getElementById('confirm-btn');
     btn.disabled = true; btn.textContent = 'Submitting…';
-    submitReading(v.id, odo, name).then(function (updated) {
+    submitReading(v.id, odo, name).then(function (result) {
+      return attachReadingPhoto(v.id, result.logId, photo).then(function (photoUrl) {
+        return sendToSheet({
+          submittedAt: new Date().toISOString(), equipmentId: equipmentId(v),
+          equipmentType: v.equipmentType || '', operator: name || '',
+          odometerSmr: odo, proofPhotoUrl: photoUrl, source: 'Fleet PMS QR'
+        }).then(function () { return result.vehicle; });
+      });
+    }).then(function (updated) {
       renderDriverConfirmed(updated);
     }).catch(function (err) {
       btn.disabled = false; btn.textContent = 'Confirm & Submit';
@@ -287,7 +403,7 @@ function renderDriverReview(v, odo, name, warn) {
 
 function renderDriverConfirmed(v) {
   app.innerHTML =
-    '<h1>' + esc(v.plate) + '</h1>' +
+    '<h1>' + esc(equipmentLabel(v)) + '</h1>' +
     '<div class="card center">' +
       '<div class="muted">Submitted</div>' +
       '<div class="big-num">' + Number(v.currentOdometer).toLocaleString() + ' km</div>' +
@@ -319,7 +435,16 @@ function renderAdminLoading() {
 }
 
 function loadAdmin() {
-  listVehicles().then(renderAdmin).catch(renderError);
+  listVehicles().then(function (vehicles) {
+    return Promise.all(vehicles.map(function (v) {
+      return listReadingLogs(v.id).then(function (logs) {
+        v.forecastPMSDate = forecastPMSDate(v, logs);
+        v.readingCount = logs.filter(function (log) { return log.recalled !== true; }).length;
+        v.readingLogs = logs;
+        return v;
+      });
+    }));
+  }).then(renderAdmin).catch(renderError);
 }
 
 function renderAdmin(vehicles) {
@@ -327,19 +452,33 @@ function renderAdmin(vehicles) {
   vehicles.forEach(function (v) { counts[computeStatus(v).status]++; });
 
   var html = '<h1>Fleet PMS Dashboard</h1>' +
-    '<p class="sub">' + vehicles.length + ' vehicle(s) — ' +
+    '<p class="sub">' + vehicles.length + ' equipment item(s) — ' +
       '<span class="badge OK">OK ' + counts.OK + '</span> ' +
       '<span class="badge DUE_SOON">Due Soon ' + counts.DUE_SOON + '</span> ' +
       '<span class="badge OVERDUE">Overdue ' + counts.OVERDUE + '</span></p>';
 
-  html += '<div class="card"><span class="toggle-link" id="add-toggle">+ Add a vehicle</span>' +
+  html += '<div class="card"><span class="toggle-link" id="add-toggle">+ Register equipment</span>' +
     '<div id="add-form" style="display:none; margin-top:12px">' +
-      '<label>Plate number</label><input id="f-plate">' +
-      '<label>Name / description (optional)</label><input id="f-name">' +
-      '<label>PMS interval (km)</label><input id="f-interval" type="number" value="5000">' +
-      '<label>Starting odometer (km)</label><input id="f-odo" type="number" value="0">' +
-      '<button class="primary" id="f-submit">Add Vehicle</button>' +
+      '<div class="grid"><div><label>Equipment ID</label><input id="f-id" placeholder="EQ-001"></div>' +
+      '<div><label>Equipment type</label><input id="f-type" placeholder="Dump truck"></div>' +
+      '<div><label>PMS interval (km / SMR)</label><input id="f-interval" type="number" value="5000"></div>' +
+      '<div><label>Last PMS odometer / SMR reading</label><input id="f-last-odo" type="number" value="0"></div>' +
+      '<div><label>Current odometer / SMR (optional)</label><input id="f-current-odo" type="number" placeholder="Same as last PMS"></div>' +
+      '<div><label>Next PMS date (optional)</label><input id="f-next-date" type="date"></div></div>' +
+      '<p class="muted">Only Equipment ID, type, PMS interval, and last PMS reading are required.</p>' +
+      '<button class="primary" id="f-submit">Register equipment</button>' +
     '</div></div>';
+
+  html += renderCalendar(vehicles);
+  html += '<div class="card setup-note"><strong>Online sheet sync</strong><p class="muted">Paste a Google Apps Script web-app URL to record every QR submission in Google Sheets. The same webhook pattern can also feed Microsoft Excel via Power Automate.</p>' +
+    '<input id="sheet-webhook" placeholder="https://script.google.com/macros/s/.../exec" value="' + esc(integrationUrl()) + '">' +
+    '<button id="save-webhook">Save sync URL</button> <span id="webhook-status" class="muted"></span></div>';
+  html += '<div class="card"><strong>Reading log export</strong><p class="muted">Download odometer/SMR submissions as a CSV file. Includes operator, timestamp, previous reading, proof photo link, and recalled status. Open the file in Excel or import it into Google Sheets.</p>' +
+    '<label for="export-date">Export date</label><input id="export-date" type="date" value="' + localDateKey(new Date()) + '">' +
+    '<div class="actions"><button class="primary" id="export-day">Export selected day</button><button id="export-all">Export all history</button></div>' +
+    '<div id="export-status" class="muted" role="status" aria-live="polite"></div></div>';
+
+  html += renderEquipmentTypeList(vehicles);
 
   if (vehicles.length === 0) {
     html += '<div class="card muted center">No vehicles yet. Add one above to generate its QR code.</div>';
@@ -349,7 +488,7 @@ function renderAdmin(vehicles) {
     var p = computeStatus(v);
     html += '<div class="card">' +
       '<div class="row">' +
-        '<div><strong>' + esc(v.plate) + '</strong>' + (v.name ? ' <span class="muted">' + esc(v.name) + '</span>' : '') + '</div>' +
+        '<div><strong>' + esc(equipmentId(v)) + '</strong> <span class="muted">' + esc(v.equipmentType || v.name || '') + '</span></div>' +
         '<span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span>' +
       '</div>' +
       '<p class="muted" style="margin:6px 0">' +
@@ -360,9 +499,12 @@ function renderAdmin(vehicles) {
       (p.specialNotice ? '<p><span class="badge notice">Notice</span> ' + esc(p.specialNotice) + '</p>' : '') +
       '<p class="muted" style="margin:2px 0">Last submitted: ' + fmtDate(v.lastSubmissionAt) +
         (v.lastSubmissionBy ? ' by ' + esc(v.lastSubmissionBy) : '') + '</p>' +
+      (scheduleDate(v) ? '<p class="muted" style="margin:2px 0">Next PMS: ' + esc(dateValue(scheduleDate(v))) + ' (' + (v.scheduleMode === 'manual' ? 'manual override' : 'automatic forecast') + ')</p>' : '<p class="muted" style="margin:2px 0">Next PMS: waiting for more operator readings</p>') +
+      (v.readingCount ? '<p class="muted" style="margin:2px 0">Historical readings used: ' + v.readingCount + '</p>' : '') +
       '<div class="actions">' +
         '<button id="qr-' + v.id + '">Show QR</button>' +
         '<button id="pms-' + v.id + '">Mark PMS Done</button>' +
+        '<button id="schedule-' + v.id + '">Schedule PMS</button>' +
         '<button id="notice-' + v.id + '">Set Notice</button>' +
         '<button class="danger" id="del-' + v.id + '">Delete</button>' +
       '</div>' +
@@ -371,37 +513,93 @@ function renderAdmin(vehicles) {
 
   app.innerHTML = html;
 
+  document.getElementById('calendar-prev').onclick = function () {
+    calendarCursor.setMonth(calendarCursor.getMonth() - 1); renderAdmin(vehicles);
+  };
+  document.getElementById('calendar-next').onclick = function () {
+    calendarCursor.setMonth(calendarCursor.getMonth() + 1); renderAdmin(vehicles);
+  };
   document.getElementById('add-toggle').onclick = function () {
     var f = document.getElementById('add-form');
     f.style.display = f.style.display === 'none' ? 'block' : 'none';
   };
   document.getElementById('f-submit').onclick = function () {
-    var plate = document.getElementById('f-plate').value.trim();
-    if (!plate) { alert('Plate number is required.'); return; }
-    var name = document.getElementById('f-name').value.trim();
+    var id = document.getElementById('f-id').value.trim();
+    var type = document.getElementById('f-type').value.trim();
     var interval = document.getElementById('f-interval').value;
-    var odo = document.getElementById('f-odo').value;
-    addVehicle(plate, name, interval, odo).then(loadAdmin).catch(function (err) {
+    var lastOdo = document.getElementById('f-last-odo').value;
+    var currentOdo = document.getElementById('f-current-odo').value;
+    var nextDate = document.getElementById('f-next-date').value;
+    if (!id || !type || !interval || lastOdo === '') { alert('Equipment ID, type, PMS interval, and last PMS reading are required.'); return; }
+    addVehicle(id, type, interval, lastOdo, currentOdo, nextDate).then(loadAdmin).catch(function (err) {
       alert('Could not add vehicle: ' + (err.message || err));
+    });
+  };
+  document.getElementById('save-webhook').onclick = function () {
+    localStorage.setItem('fleetSheetWebhook', document.getElementById('sheet-webhook').value.trim());
+    document.getElementById('webhook-status').textContent = 'Saved on this device.';
+  };
+  document.getElementById('export-day').onclick = function () {
+    var date = document.getElementById('export-date').value;
+    if (!date) { document.getElementById('export-status').textContent = 'Choose a date to export.'; return; }
+    exportReadingLogs(vehicles, date).catch(function (err) {
+      document.getElementById('export-status').textContent = 'Export failed: ' + (err.message || err);
+    });
+  };
+  document.getElementById('export-all').onclick = function () {
+    exportReadingLogs(vehicles, '').catch(function (err) {
+      document.getElementById('export-status').textContent = 'Export failed: ' + (err.message || err);
     });
   };
 
   vehicles.forEach(function (v) {
     document.getElementById('qr-' + v.id).onclick = function () { showQrModal(v); };
+    document.getElementById('list-qr-' + v.id).onclick = function () { showQrModal(v); };
     document.getElementById('pms-' + v.id).onclick = function () {
-      if (!confirm('Mark PMS as done for ' + v.plate + '? This resets the interval from the current odometer.')) return;
+      if (!confirm('Mark PMS as done for ' + equipmentId(v) + '? This resets the interval from the current odometer.')) return;
       markPMSDone(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
     };
+    document.getElementById('schedule-' + v.id).onclick = function () {
+      var date = prompt('Next PMS date for ' + equipmentId(v) + ' (YYYY-MM-DD). Leave blank to return to automatic forecast.', dateValue(scheduleDate(v)));
+      if (date === null) return;
+      if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) { alert('Use the YYYY-MM-DD format.'); return; }
+      setNextPMSDate(v.id, date).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+    };
     document.getElementById('notice-' + v.id).onclick = function () {
-      var text = prompt('Notice for ' + v.plate + ' (e.g. "Called in for brake check"). Leave blank to clear.', v.specialNotice || '');
+      var text = prompt('Notice for ' + equipmentId(v) + ' (e.g. "Called in for brake check"). Leave blank to clear.', v.specialNotice || '');
       if (text === null) return;
       setSpecialNotice(v.id, text).then(loadAdmin).catch(function (err) { alert(err.message || err); });
     };
     document.getElementById('del-' + v.id).onclick = function () {
-      if (!confirm('Delete ' + v.plate + '? This cannot be undone.')) return;
+      if (!confirm('Delete ' + equipmentId(v) + '? This cannot be undone.')) return;
       deleteVehicleFn(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
     };
   });
+}
+
+async function exportReadingLogs(vehicles, dateFilter) {
+  var status = document.getElementById('export-status');
+  status.textContent = 'Preparing export…';
+  var rows = [['Timestamp', 'Equipment ID', 'Equipment Type', 'Operator', 'Odometer/SMR Reading', 'Previous Reading', 'Proof Photo URL', 'Recalled']];
+  vehicles.forEach(function (v) {
+    (v.readingLogs || []).forEach(function (log) {
+      var timestamp = log.timestamp && log.timestamp.toDate ? log.timestamp.toDate() : new Date(log.timestamp);
+      if (!log.timestamp || isNaN(timestamp.getTime())) return;
+      if (dateFilter && localDateKey(timestamp) !== dateFilter) return;
+      rows.push([
+        timestamp.toISOString(), equipmentId(v), v.equipmentType || v.name || '',
+        log.driverName || '', log.odometer, log.prevOdometer, log.photoUrl || '',
+        log.recalled === true ? 'Yes' : 'No'
+      ]);
+    });
+  });
+  if (rows.length === 1) {
+    status.textContent = dateFilter ? 'No readings found for ' + dateFilter + '.' : 'No readings to export.';
+    return;
+  }
+  var suffix = dateFilter || 'all-history';
+  downloadCsv(rows, 'fleet-reading-logs-' + suffix + '.csv');
+  status.textContent = 'Exported ' + (rows.length - 1) + ' reading(s).';
 }
 
 function showQrModal(v) {
@@ -409,7 +607,7 @@ function showQrModal(v) {
   var bg = document.createElement('div');
   bg.className = 'modal-bg';
   bg.innerHTML = '<div class="modal">' +
-    '<strong>' + esc(v.plate) + '</strong>' +
+    '<strong>' + esc(equipmentLabel(v)) + '</strong>' +
     '<div id="qr-canvas-holder"></div>' +
     '<p class="muted" style="word-break:break-all">' + esc(url) + '</p>' +
     '<button class="primary" id="qr-close">Close</button>' +
@@ -418,6 +616,52 @@ function showQrModal(v) {
   new QRCode(document.getElementById('qr-canvas-holder'), { text: url, width: 200, height: 200 });
   document.getElementById('qr-close').onclick = function () { document.body.removeChild(bg); };
   bg.onclick = function (e) { if (e.target === bg) document.body.removeChild(bg); };
+}
+
+function renderCalendar(vehicles) {
+  var now = new Date(), year = calendarCursor.getFullYear(), month = calendarCursor.getMonth();
+  var first = new Date(year, month, 1), days = new Date(year, month + 1, 0).getDate();
+  var html = '<div class="card calendar"><div class="row"><div><button id="calendar-prev" class="ghost" type="button">&larr;</button> <strong>PMS schedule — ' + calendarCursor.toLocaleString(undefined, { month: 'long', year: 'numeric' }) + '</strong> <button id="calendar-next" class="ghost" type="button">&rarr;</button></div><span class="muted">Set an optional Next PMS date when registering equipment</span></div><div class="calendar-head">';
+  ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(function (d) { html += '<div>' + d + '</div>'; });
+  html += '</div><div class="calendar-grid">';
+  for (var i = 0; i < first.getDay(); i++) html += '<div class="calendar-day empty"></div>';
+  for (var day = 1; day <= days; day++) {
+    var key = year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+    var today = key === dateValue(now);
+    html += '<div class="calendar-day' + (today ? ' today' : '') + '"><strong>' + day + '</strong>';
+    vehicles.forEach(function (v) {
+      if (dateKey(scheduleDate(v)) === key) html += '<span class="event">' + esc(equipmentId(v)) + (v.scheduleMode === 'manual' ? ' (manual)' : '') + '</span>';
+    });
+    html += '</div>';
+  }
+  return html + '</div></div>';
+}
+
+function renderEquipmentTypeList(vehicles) {
+    var groups = {};
+    vehicles.forEach(function (v) {
+      var type = (v.equipmentType || v.name || 'Unspecified type').trim();
+      if (!groups[type]) groups[type] = [];
+      groups[type].push(v);
+    });
+    var types = Object.keys(groups).sort(function (a, b) { return a.localeCompare(b); });
+    var html = '<div class="card type-list"><div class="row"><strong>Equipment list by type</strong><span class="muted">' + vehicles.length + ' total</span></div>';
+    if (!types.length) return html + '<p class="muted">No registered equipment yet.</p></div>';
+    types.forEach(function (type) {
+      html += '<div class="type-group"><div class="type-group-title">' + esc(type) + ' <span class="muted">(' + groups[type].length + ')</span></div>';
+      groups[type].sort(function (a, b) { return equipmentId(a).localeCompare(equipmentId(b)); }).forEach(function (v) {
+        var p = computeStatus(v);
+        var next = scheduleDate(v);
+        html += '<div class="equipment-row">' +
+          '<div><strong>' + esc(equipmentId(v)) + '</strong><small>Odometer/SMR: ' + Number(v.currentOdometer).toLocaleString() + '</small></div>' +
+          '<div><span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span><small>' + p.kmSinceLastPMS.toLocaleString() + ' since last PMS</small></div>' +
+          '<div><strong>' + (next ? esc(dateValue(next)) : 'Not forecast yet') + '</strong><small>' + (v.scheduleMode === 'manual' ? 'Manual override' : 'Automatic forecast') + '</small></div>' +
+          '<button id="list-qr-' + v.id + '" type="button">QR</button>' +
+          '</div>';
+      });
+      html += '</div>';
+    });
+    return html + '</div>';
 }
 </script>
 </body>
