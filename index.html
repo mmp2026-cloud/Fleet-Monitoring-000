@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html>
 <head>
 <meta charset="UTF-8">
@@ -150,7 +149,7 @@ function dateKey(value) { return dateValue(value); }
 function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
 function scheduleDate(v) { return v.scheduleMode === 'manual' ? v.nextPMSDate : (v.forecastPMSDate || ''); }
 function adminAuthEmail(username) {
-  if (username.trim().toLowerCase() !== 'dmc_cloud') throw new Error('Hindi tama ang username o password.');
+  if (username.trim().toLowerCase() !== 'dmc_3cloud$!'.toLowerCase()) throw new Error('Hindi tama ang Company ID o password.');
   return 'dmc_cloud@fleet-monitoring-000.firebaseapp.com';
 }
 function localDateKey(date) {
@@ -315,7 +314,7 @@ onAuthStateChanged(auth, function (user) {
 function renderAdminLogin(message) {
   app.innerHTML = '<div class="card auth-card"><h1>Fleet PMS Admin</h1>' +
     '<p class="sub">Mag-sign in gamit ang admin username at password.</p>' +
-    '<form id="admin-login-form"><label for="admin-username">Username</label><input id="admin-username" type="text" autocomplete="username" required>' +
+    '<form id="admin-login-form"><label for="admin-username">Company ID</label><input id="admin-username" type="text" autocomplete="username" required>' +
     '<label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required>' +
     '<div id="login-error" class="err">' + (message ? esc(message) : '') + '</div>' +
     '<button class="primary" type="submit" style="width:100%">Sign in</button></form>' +
@@ -336,7 +335,7 @@ function renderAdminLogin(message) {
     }
     signInWithEmailAndPassword(auth, email, password).catch(function (err) {
       if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
-        error.textContent = 'Hindi tama ang username o password.';
+        error.textContent = 'Hindi tama ang Company ID o password.';
       } else if (err.code === 'auth/operation-not-allowed') {
         error.textContent = 'I-enable muna ang Email/Password sa Firebase Authentication.';
       } else {
