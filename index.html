@@ -158,6 +158,12 @@ function dateValue(value) {
   var d = value.toDate ? value.toDate() : new Date(value);
   return isNaN(d) ? '' : d.toISOString().slice(0, 10);
 }
+function dateInputValue(value) {
+  if (!value) return '';
+  var d = value.toDate ? value.toDate() : new Date(value);
+  if (isNaN(d)) return '';
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
 function dateKey(value) { return dateValue(value); }
 function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
 function scheduleDate(v, service) {
@@ -225,7 +231,7 @@ function forecastServiceDate(v, logs, service) {
   forecast.setDate(forecast.getDate() + Math.ceil(remaining / dailyUsage));
   return forecast.toISOString().slice(0, 10);
 }
-async function addVehicle(id, type, generalIntervalKm, lastPmsOdometer, lastGeneralOdometer, currentOdometer, nextPmsDate, nextGeneralDate) {
+async function addVehicle(id, type, generalIntervalKm, lastPmsOdometer, lastGeneralOdometer, currentOdometer, lastPmsDate, lastGeneralDate, nextPmsDate, nextGeneralDate) {
   var lastPmsOdo = Number(lastPmsOdometer);
   var lastGeneralOdo = lastGeneralOdometer === '' ? lastPmsOdo : Number(lastGeneralOdometer);
   var currentOdo = currentOdometer === ''
@@ -241,8 +247,10 @@ async function addVehicle(id, type, generalIntervalKm, lastPmsOdometer, lastGene
   var ref = await addDoc(collection(db, 'vehicles'), {
     equipmentId: id.trim(), equipmentType: type.trim(),
     generalServiceIntervalKm: generalInterval, pmsIntervalKm: generalInterval * 2,
-    lastPMSOdometer: lastPmsOdo, lastPMSDate: serverTimestamp(),
-    lastGeneralServiceOdometer: lastGeneralOdo, lastGeneralServiceDate: serverTimestamp(),
+    lastPMSOdometer: lastPmsOdo,
+    lastPMSDate: lastPmsDate ? new Date(lastPmsDate + 'T12:00:00') : serverTimestamp(),
+    lastGeneralServiceOdometer: lastGeneralOdo,
+    lastGeneralServiceDate: lastGeneralDate ? new Date(lastGeneralDate + 'T12:00:00') : serverTimestamp(),
     nextPMSDate: nextPmsDate || '', pmsScheduleMode: nextPmsDate ? 'manual' : 'auto',
     nextGeneralServiceDate: nextGeneralDate || '',
     generalServiceScheduleMode: nextGeneralDate ? 'manual' : 'auto',
@@ -262,7 +270,7 @@ async function updateVehicleDetails(id, values) {
       || !Number.isFinite(generalInterval) || generalInterval <= 0) {
     throw new Error('Tiyaking tama ang Equipment ID/type, General Servicing interval, at mga huling reading.');
   }
-  await updateDoc(doc(db, 'vehicles', id), {
+  var updates = {
     equipmentId: values.equipmentId.trim(),
     equipmentType: values.equipmentType.trim(),
     generalServiceIntervalKm: generalInterval,
@@ -276,7 +284,10 @@ async function updateVehicleDetails(id, values) {
     generalServiceScheduleMode: values.nextGeneralServiceDate ? 'manual' : 'auto',
     forecastPMSDate: '',
     forecastGeneralServiceDate: ''
-  });
+  }
+  if (values.lastPMSDate) updates.lastPMSDate = new Date(values.lastPMSDate + 'T12:00:00');
+  if (values.lastGeneralServiceDate) updates.lastGeneralServiceDate = new Date(values.lastGeneralServiceDate + 'T12:00:00');
+  await updateDoc(doc(db, 'vehicles', id), updates);
   return getVehicle(id);
 }
 async function deleteVehicleFn(id) {
@@ -587,7 +598,9 @@ function renderAdmin(vehicles) {
       '<div><label>General Servicing interval (km / SMR)</label><input id="f-interval" name="new-general-service-interval" autocomplete="off" type="number" min="1" placeholder="e.g. 2500"></div>' +
       '<div><label>PMS interval (automatic: 2× General Servicing)</label><input id="f-pms-interval-preview" type="number" value="5000" readonly></div>' +
       '<div><label>Last PMS odometer / SMR reading</label><input id="f-last-odo" name="new-last-pms-reading" autocomplete="off" type="number" min="0"></div>' +
+      '<div><label>Last PMS date (optional)</label><input id="f-last-pms-date" name="new-last-pms-date" autocomplete="off" type="date"></div>' +
       '<div><label>Last General Servicing reading (optional; defaults to last PMS reading)</label><input id="f-last-general-odo" name="new-last-general-reading" autocomplete="off" type="number" min="0"></div>' +
+      '<div><label>Last General Servicing date (optional; defaults to PMS date)</label><input id="f-last-general-date" name="new-last-general-date" autocomplete="off" type="date"></div>' +
       '<div><label>Current odometer / SMR (optional)</label><input id="f-current-odo" name="new-current-reading" autocomplete="off" type="number" min="0" placeholder="Same as most recent service"></div>' +
       '<div><label>Next PMS date (optional)</label><input id="f-next-date" name="new-next-pms-date" autocomplete="off" type="date"></div>' +
       '<div><label>Next General Servicing date (optional)</label><input id="f-next-general-date" name="new-next-general-date" autocomplete="off" type="date"></div>' +
@@ -624,7 +637,9 @@ function renderAdmin(vehicles) {
         'Odometer: ' + Number(v.currentOdometer).toLocaleString() + ' km &middot; ' +
         p.kmSinceLastPMS.toLocaleString() + ' km since PMS (' + Number(v.pmsIntervalKm || generalServiceInterval(v) * 2).toLocaleString() + ' interval)' +
       '</p>' +
+      '<p class="muted" style="margin:2px 0">Last PMS: ' + Number(v.lastPMSOdometer).toLocaleString() + ' km / SMR' + (v.lastPMSDate ? ' on ' + esc(dateValue(v.lastPMSDate)) : '') + '</p>' +
       '<p class="muted" style="margin:2px 0">General Servicing: ' + gs.kmSinceLastPMS.toLocaleString() + ' km since last service (' + generalServiceInterval(v).toLocaleString() + ' interval) &middot; <span class="badge ' + gs.status + '">' + statusLabel(gs.status) + '</span></p>' +
+      '<p class="muted" style="margin:2px 0">Last General Servicing: ' + Number(v.lastGeneralServiceOdometer == null ? v.lastPMSOdometer : v.lastGeneralServiceOdometer).toLocaleString() + ' km / SMR' + (v.lastGeneralServiceDate ? ' on ' + esc(dateValue(v.lastGeneralServiceDate)) : '') + '</p>' +
       (p.specialNotice ? '<p><span class="badge notice">Notice</span> ' + esc(p.specialNotice) + '</p>' : '') +
       '<p class="muted" style="margin:2px 0">Last submitted: ' + fmtDate(v.lastSubmissionAt) +
         (v.lastSubmissionBy ? ' by ' + esc(v.lastSubmissionBy) : '') + '</p>' +
@@ -668,7 +683,9 @@ function renderAdmin(vehicles) {
     var type = document.getElementById('f-type').value.trim();
     var interval = document.getElementById('f-interval').value;
     var lastOdo = document.getElementById('f-last-odo').value;
+    var lastPmsDate = document.getElementById('f-last-pms-date').value;
     var lastGeneralOdo = document.getElementById('f-last-general-odo').value;
+    var lastGeneralDate = document.getElementById('f-last-general-date').value || lastPmsDate;
     var currentOdo = document.getElementById('f-current-odo').value;
     var nextDate = document.getElementById('f-next-date').value;
     var nextGeneralDate = document.getElementById('f-next-general-date').value;
@@ -676,7 +693,7 @@ function renderAdmin(vehicles) {
       alert('Equipment ID, type, General Servicing interval, at Last PMS reading ay required.');
       return;
     }
-    addVehicle(id, type, interval, lastOdo, lastGeneralOdo, currentOdo, nextDate, nextGeneralDate).then(loadAdmin).catch(function (err) {
+    addVehicle(id, type, interval, lastOdo, lastGeneralOdo, currentOdo, lastPmsDate, lastGeneralDate, nextDate, nextGeneralDate).then(loadAdmin).catch(function (err) {
       alert('Could not add vehicle: ' + (err.message || err));
     });
   };
@@ -780,7 +797,9 @@ function showEditEquipmentModal(v) {
     '<label for="edit-general-interval">General Servicing interval (km / SMR; PMS is automatically double)</label><input id="edit-general-interval" type="number" min="1" value="' + esc(generalServiceInterval(v)) + '">' +
     '<label>PMS interval (calculated)</label><input id="edit-pms-interval-preview" type="number" value="' + esc(generalServiceInterval(v) * 2) + '" readonly>' +
     '<label for="edit-last-pms">Last PMS odometer / SMR reading</label><input id="edit-last-pms" type="number" min="0" value="' + esc(v.lastPMSOdometer) + '">' +
+    '<label for="edit-last-pms-date">Last PMS date</label><input id="edit-last-pms-date" type="date" value="' + esc(dateInputValue(v.lastPMSDate)) + '">' +
     '<label for="edit-last-general">Last General Servicing odometer / SMR reading</label><input id="edit-last-general" type="number" min="0" value="' + esc(v.lastGeneralServiceOdometer == null ? v.lastPMSOdometer : v.lastGeneralServiceOdometer) + '">' +
+    '<label for="edit-last-general-date">Last General Servicing date</label><input id="edit-last-general-date" type="date" value="' + esc(dateInputValue(v.lastGeneralServiceDate || v.lastPMSDate)) + '">' +
     '<label for="edit-current-odo">Current odometer / SMR</label><input id="edit-current-odo" type="number" min="0" value="' + esc(v.currentOdometer) + '">' +
     '<label for="edit-next-pms-date">Next PMS date (optional; blank uses automatic forecast)</label><input id="edit-next-pms-date" type="date" value="' + esc(dateValue(scheduleDate(v, 'pms'))) + '">' +
     '<label for="edit-next-general-date">Next General Servicing date (optional; blank uses automatic forecast)</label><input id="edit-next-general-date" type="date" value="' + esc(dateValue(scheduleDate(v, 'general'))) + '">' +
@@ -800,7 +819,9 @@ function showEditEquipmentModal(v) {
       equipmentType: document.getElementById('edit-equipment-type').value,
       generalServiceIntervalKm: document.getElementById('edit-general-interval').value,
       lastPMSOdometer: document.getElementById('edit-last-pms').value,
+      lastPMSDate: document.getElementById('edit-last-pms-date').value,
       lastGeneralServiceOdometer: document.getElementById('edit-last-general').value,
+      lastGeneralServiceDate: document.getElementById('edit-last-general-date').value,
       currentOdometer: document.getElementById('edit-current-odo').value,
       nextPMSDate: document.getElementById('edit-next-pms-date').value,
       nextGeneralServiceDate: document.getElementById('edit-next-general-date').value
