@@ -70,7 +70,7 @@
   .type-list { margin-top: 16px; }
   .type-group { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 10px; }
   .type-group-title { background: #f9fafb; padding: 10px 12px; font-weight: 700; }
-  .equipment-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap: 10px; align-items: center; padding: 11px 12px; border-top: 1px solid var(--border); }
+  .equipment-row { display: grid; grid-template-columns: 1.1fr 1.2fr 1.2fr 1.2fr auto; gap: 10px; align-items: center; padding: 11px 12px; border-top: 1px solid var(--border); }
   .equipment-row small { color: var(--muted); display: block; margin-top: 3px; }
   .auth-card { max-width: 440px; margin: 48px auto; }
   @media (max-width: 640px) { .equipment-row { grid-template-columns: 1fr 1fr; } .equipment-row .badge { justify-self: start; } }
@@ -129,8 +129,16 @@ function fmtDate(ts) {
   return isNaN(d) ? '—' : d.toLocaleString();
 }
 function computeStatus(v) {
-  var interval = Number(v.pmsIntervalKm) || 0;
-  var since = Number(v.currentOdometer) - Number(v.lastPMSOdometer);
+  return computeServiceStatus(v, 'pms');
+}
+function computeServiceStatus(v, service) {
+  var interval = service === 'general'
+    ? generalServiceInterval(v)
+    : Number(v.pmsIntervalKm) || generalServiceInterval(v) * 2;
+  var lastReading = service === 'general'
+    ? (v.lastGeneralServiceOdometer == null ? Number(v.lastPMSOdometer) || 0 : Number(v.lastGeneralServiceOdometer))
+    : Number(v.lastPMSOdometer) || 0;
+  var since = Number(v.currentOdometer) - lastReading;
   var remaining = interval - since;
   var status = 'OK';
   if (interval > 0) {
@@ -138,6 +146,10 @@ function computeStatus(v) {
     else if (remaining <= interval * DUE_SOON_RATIO) status = 'DUE_SOON';
   }
   return { kmSinceLastPMS: since, remaining: remaining, status: status, specialNotice: v.specialNotice || '' };
+}
+function generalServiceInterval(v) {
+  if (v.generalServiceIntervalKm != null) return Number(v.generalServiceIntervalKm) || 0;
+  return (Number(v.pmsIntervalKm) || 0) / 2;
 }
 function equipmentId(v) { return v.equipmentId || v.plate || v.id; }
 function equipmentLabel(v) { return equipmentId(v) + (v.equipmentType ? ' — ' + v.equipmentType : (v.name ? ' — ' + v.name : '')); }
@@ -148,7 +160,16 @@ function dateValue(value) {
 }
 function dateKey(value) { return dateValue(value); }
 function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
-function scheduleDate(v) { return v.scheduleMode === 'manual' ? v.nextPMSDate : (v.forecastPMSDate || ''); }
+function scheduleDate(v, service) {
+  if (service === 'general') {
+    return v.generalServiceScheduleMode === 'manual'
+      ? v.nextGeneralServiceDate
+      : (v.forecastGeneralServiceDate || '');
+  }
+  return (v.pmsScheduleMode || v.scheduleMode) === 'manual'
+    ? v.nextPMSDate
+    : (v.forecastPMSDate || '');
+}
 function localDateKey(date) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
@@ -180,10 +201,15 @@ async function listReadingLogs(vehicleId) {
   var snap = await getDocs(query(collection(db, 'vehicles', vehicleId, 'logs'), orderBy('timestamp', 'asc')));
   return snap.docs.map(function (d) { return Object.assign({ id: d.id }, d.data()); });
 }
-function forecastPMSDate(v, logs) {
-  if (v.scheduleMode === 'manual' && v.nextPMSDate) return v.nextPMSDate;
-  var interval = Number(v.pmsIntervalKm) || 0;
-  var remaining = interval - (Number(v.currentOdometer) - Number(v.lastPMSOdometer));
+function forecastServiceDate(v, logs, service) {
+  var manualMode = service === 'general' ? v.generalServiceScheduleMode : (v.pmsScheduleMode || v.scheduleMode);
+  var manualDate = service === 'general' ? v.nextGeneralServiceDate : v.nextPMSDate;
+  if (manualMode === 'manual' && manualDate) return manualDate;
+  var interval = service === 'general' ? generalServiceInterval(v) : (Number(v.pmsIntervalKm) || generalServiceInterval(v) * 2);
+  var lastReading = service === 'general'
+    ? (v.lastGeneralServiceOdometer == null ? Number(v.lastPMSOdometer) || 0 : Number(v.lastGeneralServiceOdometer))
+    : Number(v.lastPMSOdometer) || 0;
+  var remaining = interval - (Number(v.currentOdometer) - lastReading);
   if (interval <= 0 || remaining <= 0) return '';
   var points = (logs || []).filter(function (log) {
     return log.recalled !== true && log.timestamp && Number(log.odometer) >= 0;
@@ -199,56 +225,92 @@ function forecastPMSDate(v, logs) {
   forecast.setDate(forecast.getDate() + Math.ceil(remaining / dailyUsage));
   return forecast.toISOString().slice(0, 10);
 }
-async function addVehicle(id, type, pmsIntervalKm, lastPmsOdometer, currentOdometer, nextPmsDate) {
-  var lastOdo = Number(lastPmsOdometer) || 0;
-  var currentOdo = currentOdometer === '' ? lastOdo : Number(currentOdometer);
+async function addVehicle(id, type, generalIntervalKm, lastPmsOdometer, lastGeneralOdometer, currentOdometer, nextPmsDate, nextGeneralDate) {
+  var lastPmsOdo = Number(lastPmsOdometer);
+  var lastGeneralOdo = lastGeneralOdometer === '' ? lastPmsOdo : Number(lastGeneralOdometer);
+  var currentOdo = currentOdometer === ''
+    ? Math.max(lastPmsOdo, lastGeneralOdo)
+    : Number(currentOdometer);
+  var generalInterval = Number(generalIntervalKm);
+  if (!id.trim() || !type.trim() || !Number.isFinite(generalInterval) || generalInterval <= 0
+      || !Number.isFinite(lastPmsOdo) || lastPmsOdo < 0
+      || !Number.isFinite(lastGeneralOdo) || lastGeneralOdo < 0
+      || !Number.isFinite(currentOdo) || currentOdo < 0) {
+    throw new Error('Tiyaking tama ang Equipment ID/type, General Servicing interval, at mga huling reading.');
+  }
   var ref = await addDoc(collection(db, 'vehicles'), {
-    equipmentId: id, equipmentType: type, pmsIntervalKm: Number(pmsIntervalKm) || 0,
-    lastPMSOdometer: lastOdo, lastPMSDate: serverTimestamp(), nextPMSDate: nextPmsDate || '',
-    scheduleMode: nextPmsDate ? 'manual' : 'auto',
+    equipmentId: id.trim(), equipmentType: type.trim(),
+    generalServiceIntervalKm: generalInterval, pmsIntervalKm: generalInterval * 2,
+    lastPMSOdometer: lastPmsOdo, lastPMSDate: serverTimestamp(),
+    lastGeneralServiceOdometer: lastGeneralOdo, lastGeneralServiceDate: serverTimestamp(),
+    nextPMSDate: nextPmsDate || '', pmsScheduleMode: nextPmsDate ? 'manual' : 'auto',
+    nextGeneralServiceDate: nextGeneralDate || '',
+    generalServiceScheduleMode: nextGeneralDate ? 'manual' : 'auto',
     currentOdometer: currentOdo, lastSubmissionAt: null, lastSubmissionBy: '', specialNotice: ''
   });
   return getVehicle(ref.id);
 }
 async function updateVehicleDetails(id, values) {
-  var lastOdo = Number(values.lastPMSOdometer);
+  var lastPmsOdo = Number(values.lastPMSOdometer);
+  var lastGeneralOdo = Number(values.lastGeneralServiceOdometer);
   var currentOdo = Number(values.currentOdometer);
-  var interval = Number(values.pmsIntervalKm);
+  var generalInterval = Number(values.generalServiceIntervalKm);
   if (!values.equipmentId.trim() || !values.equipmentType.trim()
-      || !Number.isFinite(lastOdo) || lastOdo < 0
+      || !Number.isFinite(lastPmsOdo) || lastPmsOdo < 0
+      || !Number.isFinite(lastGeneralOdo) || lastGeneralOdo < 0
       || !Number.isFinite(currentOdo) || currentOdo < 0
-      || !Number.isFinite(interval) || interval <= 0) {
-    throw new Error('Tiyaking may Equipment ID/type at valid na PMS interval at odometer readings.');
+      || !Number.isFinite(generalInterval) || generalInterval <= 0) {
+    throw new Error('Tiyaking tama ang Equipment ID/type, General Servicing interval, at mga huling reading.');
   }
   await updateDoc(doc(db, 'vehicles', id), {
     equipmentId: values.equipmentId.trim(),
     equipmentType: values.equipmentType.trim(),
-    pmsIntervalKm: interval,
-    lastPMSOdometer: lastOdo,
+    generalServiceIntervalKm: generalInterval,
+    pmsIntervalKm: generalInterval * 2,
+    lastPMSOdometer: lastPmsOdo,
+    lastGeneralServiceOdometer: lastGeneralOdo,
     currentOdometer: currentOdo,
     nextPMSDate: values.nextPMSDate || '',
-    scheduleMode: values.nextPMSDate ? 'manual' : 'auto',
-    forecastPMSDate: ''
+    pmsScheduleMode: values.nextPMSDate ? 'manual' : 'auto',
+    nextGeneralServiceDate: values.nextGeneralServiceDate || '',
+    generalServiceScheduleMode: values.nextGeneralServiceDate ? 'manual' : 'auto',
+    forecastPMSDate: '',
+    forecastGeneralServiceDate: ''
   });
   return getVehicle(id);
 }
 async function deleteVehicleFn(id) {
   await deleteDoc(doc(db, 'vehicles', id));
 }
-async function markPMSDone(id) {
+async function markServiceDone(id, service) {
   var v = await getVehicle(id);
-  await updateDoc(doc(db, 'vehicles', id), {
-    lastPMSOdometer: v.currentOdometer, lastPMSDate: serverTimestamp(), nextPMSDate: '',
-    scheduleMode: 'auto', specialNotice: ''
-  });
+  var fields = service === 'general'
+    ? {
+      lastGeneralServiceOdometer: v.currentOdometer,
+      lastGeneralServiceDate: serverTimestamp(),
+      nextGeneralServiceDate: '',
+      generalServiceScheduleMode: 'auto'
+    }
+    : {
+      lastPMSOdometer: v.currentOdometer,
+      lastPMSDate: serverTimestamp(),
+      nextPMSDate: '',
+      pmsScheduleMode: 'auto',
+      scheduleMode: 'auto',
+      specialNotice: ''
+    };
+  await updateDoc(doc(db, 'vehicles', id), fields);
   return getVehicle(id);
 }
 async function setSpecialNotice(id, text) {
   await updateDoc(doc(db, 'vehicles', id), { specialNotice: text || '' });
   return getVehicle(id);
 }
-async function setNextPMSDate(id, date) {
-  await updateDoc(doc(db, 'vehicles', id), { nextPMSDate: date || '', scheduleMode: date ? 'manual' : 'auto' });
+async function setNextServiceDate(id, service, date) {
+  var fields = service === 'general'
+    ? { nextGeneralServiceDate: date || '', generalServiceScheduleMode: date ? 'manual' : 'auto' }
+    : { nextPMSDate: date || '', pmsScheduleMode: date ? 'manual' : 'auto', scheduleMode: date ? 'manual' : 'auto' };
+  await updateDoc(doc(db, 'vehicles', id), fields);
   return getVehicle(id);
 }
 async function submitReading(vehicleId, odometer, driverName) {
@@ -379,8 +441,11 @@ function renderError(err) {
 
 function statusBanner(v) {
   var p = computeStatus(v);
-  var html = '<div class="row"><span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span>' +
-    '<span class="muted">' + p.kmSinceLastPMS.toLocaleString() + ' km since last PMS</span></div>';
+  var gs = computeServiceStatus(v, 'general');
+  var html = '<div class="row"><span class="badge ' + p.status + '">PMS ' + statusLabel(p.status) + '</span>' +
+    '<span class="muted">' + p.kmSinceLastPMS.toLocaleString() + ' km since last PMS</span></div>' +
+    '<div class="row" style="margin-top:6px"><span class="badge ' + gs.status + '">General Servicing ' + statusLabel(gs.status) + '</span>' +
+    '<span class="muted">' + gs.kmSinceLastPMS.toLocaleString() + ' km since last General Servicing</span></div>';
   if (p.status === 'OVERDUE') {
     html += '<p class="muted">Overdue by ' + Math.abs(p.remaining).toLocaleString() + ' km.</p>';
   } else if (p.status === 'DUE_SOON') {
@@ -495,7 +560,8 @@ function loadAdmin() {
   listVehicles().then(function (vehicles) {
     return Promise.all(vehicles.map(function (v) {
       return listReadingLogs(v.id).then(function (logs) {
-        v.forecastPMSDate = forecastPMSDate(v, logs);
+        v.forecastPMSDate = forecastServiceDate(v, logs, 'pms');
+        v.forecastGeneralServiceDate = forecastServiceDate(v, logs, 'general');
         v.readingCount = logs.filter(function (log) { return log.recalled !== true; }).length;
         v.readingLogs = logs;
         return v;
@@ -515,16 +581,19 @@ function renderAdmin(vehicles) {
       '<span class="badge OVERDUE">Overdue ' + counts.OVERDUE + '</span></p>';
 
   html += '<div class="card"><span class="toggle-link" id="add-toggle">+ Register equipment</span>' +
-    '<div id="add-form" style="display:none; margin-top:12px">' +
-      '<div class="grid"><div><label>Equipment ID</label><input id="f-id" placeholder="EQ-001"></div>' +
-      '<div><label>Equipment type</label><input id="f-type" placeholder="Dump truck"></div>' +
-      '<div><label>PMS interval (km / SMR)</label><input id="f-interval" type="number" value="5000"></div>' +
-      '<div><label>Last PMS odometer / SMR reading</label><input id="f-last-odo" type="number" value="0"></div>' +
-      '<div><label>Current odometer / SMR (optional)</label><input id="f-current-odo" type="number" placeholder="Same as last PMS"></div>' +
-      '<div><label>Next PMS date (optional)</label><input id="f-next-date" type="date"></div></div>' +
-      '<p class="muted">Only Equipment ID, type, PMS interval, and last PMS reading are required.</p>' +
-      '<button class="primary" id="f-submit">Register equipment</button>' +
-    '</div></div>';
+    '<form id="add-form" autocomplete="off" style="display:none; margin-top:12px">' +
+      '<div><label>Equipment ID</label><input id="f-id" name="new-equipment-id" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="EQ-001"></div>' +
+      '<div><label>Equipment type</label><input id="f-type" name="new-equipment-type" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Dump truck"></div>' +
+      '<div><label>General Servicing interval (km / SMR)</label><input id="f-interval" name="new-general-service-interval" autocomplete="off" type="number" min="1" placeholder="e.g. 2500"></div>' +
+      '<div><label>PMS interval (automatic: 2× General Servicing)</label><input id="f-pms-interval-preview" type="number" value="5000" readonly></div>' +
+      '<div><label>Last PMS odometer / SMR reading</label><input id="f-last-odo" name="new-last-pms-reading" autocomplete="off" type="number" min="0"></div>' +
+      '<div><label>Last General Servicing reading (optional; defaults to last PMS reading)</label><input id="f-last-general-odo" name="new-last-general-reading" autocomplete="off" type="number" min="0"></div>' +
+      '<div><label>Current odometer / SMR (optional)</label><input id="f-current-odo" name="new-current-reading" autocomplete="off" type="number" min="0" placeholder="Same as most recent service"></div>' +
+      '<div><label>Next PMS date (optional)</label><input id="f-next-date" name="new-next-pms-date" autocomplete="off" type="date"></div>' +
+      '<div><label>Next General Servicing date (optional)</label><input id="f-next-general-date" name="new-next-general-date" autocomplete="off" type="date"></div>' +
+      '<p class="muted">Ilagay ang General Servicing interval. Awtomatikong doble nito ang PMS interval. Optional ang General Servicing reading; gagamitin ang last PMS reading kung blanko.</p>' +
+      '<button class="primary" id="f-submit" type="button">Register equipment</button>' +
+    '</form></div>';
 
   html += renderCalendar(vehicles);
   html += '<div class="card setup-note"><strong>Online sheet sync</strong><p class="muted">Paste a Google Apps Script web-app URL to record every QR submission in Google Sheets. The same webhook pattern can also feed Microsoft Excel via Power Automate.</p>' +
@@ -543,6 +612,9 @@ function renderAdmin(vehicles) {
 
   vehicles.forEach(function (v) {
     var p = computeStatus(v);
+    var gs = computeServiceStatus(v, 'general');
+    var pmsDate = scheduleDate(v, 'pms');
+    var generalDate = scheduleDate(v, 'general');
     html += '<div class="card">' +
       '<div class="row">' +
         '<div><strong>' + esc(equipmentId(v)) + '</strong> <span class="muted">' + esc(v.equipmentType || v.name || '') + '</span></div>' +
@@ -550,19 +622,22 @@ function renderAdmin(vehicles) {
       '</div>' +
       '<p class="muted" style="margin:6px 0">' +
         'Odometer: ' + Number(v.currentOdometer).toLocaleString() + ' km &middot; ' +
-        p.kmSinceLastPMS.toLocaleString() + ' km since last PMS' +
-        (v.pmsIntervalKm ? ' (interval ' + Number(v.pmsIntervalKm).toLocaleString() + ' km)' : '') +
+        p.kmSinceLastPMS.toLocaleString() + ' km since PMS (' + Number(v.pmsIntervalKm || generalServiceInterval(v) * 2).toLocaleString() + ' interval)' +
       '</p>' +
+      '<p class="muted" style="margin:2px 0">General Servicing: ' + gs.kmSinceLastPMS.toLocaleString() + ' km since last service (' + generalServiceInterval(v).toLocaleString() + ' interval) &middot; <span class="badge ' + gs.status + '">' + statusLabel(gs.status) + '</span></p>' +
       (p.specialNotice ? '<p><span class="badge notice">Notice</span> ' + esc(p.specialNotice) + '</p>' : '') +
       '<p class="muted" style="margin:2px 0">Last submitted: ' + fmtDate(v.lastSubmissionAt) +
         (v.lastSubmissionBy ? ' by ' + esc(v.lastSubmissionBy) : '') + '</p>' +
-      (scheduleDate(v) ? '<p class="muted" style="margin:2px 0">Next PMS: ' + esc(dateValue(scheduleDate(v))) + ' (' + (v.scheduleMode === 'manual' ? 'manual override' : 'automatic forecast') + ')</p>' : '<p class="muted" style="margin:2px 0">Next PMS: waiting for more operator readings</p>') +
+      '<p class="muted" style="margin:2px 0">Next PMS: ' + (pmsDate ? esc(dateValue(pmsDate)) + ' (' + ((v.pmsScheduleMode || v.scheduleMode) === 'manual' ? 'manual' : 'forecast') + ')' : 'waiting for readings') + '</p>' +
+      '<p class="muted" style="margin:2px 0">Next General Servicing: ' + (generalDate ? esc(dateValue(generalDate)) + ' (' + (v.generalServiceScheduleMode === 'manual' ? 'manual' : 'forecast') + ')' : 'waiting for readings') + '</p>' +
       (v.readingCount ? '<p class="muted" style="margin:2px 0">Historical readings used: ' + v.readingCount + '</p>' : '') +
       '<div class="actions">' +
         '<button id="qr-' + v.id + '">Show QR</button>' +
         '<button id="edit-' + v.id + '">Edit equipment</button>' +
         '<button id="pms-' + v.id + '">Mark PMS Done</button>' +
-        '<button id="schedule-' + v.id + '">Schedule PMS</button>' +
+        '<button id="general-' + v.id + '">Mark General Servicing Done</button>' +
+        '<button id="schedule-pms-' + v.id + '">Schedule PMS</button>' +
+        '<button id="schedule-general-' + v.id + '">Schedule General Servicing</button>' +
         '<button id="notice-' + v.id + '">Set Notice</button>' +
         '<button class="danger" id="del-' + v.id + '">Delete</button>' +
       '</div>' +
@@ -584,15 +659,24 @@ function renderAdmin(vehicles) {
     var f = document.getElementById('add-form');
     f.style.display = f.style.display === 'none' ? 'block' : 'none';
   };
+  document.getElementById('f-interval').oninput = function () {
+    var general = Number(this.value) || 0;
+    document.getElementById('f-pms-interval-preview').value = general * 2;
+  };
   document.getElementById('f-submit').onclick = function () {
     var id = document.getElementById('f-id').value.trim();
     var type = document.getElementById('f-type').value.trim();
     var interval = document.getElementById('f-interval').value;
     var lastOdo = document.getElementById('f-last-odo').value;
+    var lastGeneralOdo = document.getElementById('f-last-general-odo').value;
     var currentOdo = document.getElementById('f-current-odo').value;
     var nextDate = document.getElementById('f-next-date').value;
-    if (!id || !type || !interval || lastOdo === '') { alert('Equipment ID, type, PMS interval, and last PMS reading are required.'); return; }
-    addVehicle(id, type, interval, lastOdo, currentOdo, nextDate).then(loadAdmin).catch(function (err) {
+    var nextGeneralDate = document.getElementById('f-next-general-date').value;
+    if (!id || !type || !interval || lastOdo === '') {
+      alert('Equipment ID, type, General Servicing interval, at Last PMS reading ay required.');
+      return;
+    }
+    addVehicle(id, type, interval, lastOdo, lastGeneralOdo, currentOdo, nextDate, nextGeneralDate).then(loadAdmin).catch(function (err) {
       alert('Could not add vehicle: ' + (err.message || err));
     });
   };
@@ -618,15 +702,22 @@ function renderAdmin(vehicles) {
     document.getElementById('list-qr-' + v.id).onclick = function () { showQrModal(v); };
     document.getElementById('edit-' + v.id).onclick = function () { showEditEquipmentModal(v); };
     document.getElementById('pms-' + v.id).onclick = function () {
-      if (!confirm('Mark PMS as done for ' + equipmentId(v) + '? This resets the interval from the current odometer.')) return;
-      markPMSDone(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+      if (!confirm('Mark PMS as done for ' + equipmentId(v) + '? This resets the PMS interval from the current odometer.')) return;
+      markServiceDone(v.id, 'pms').then(loadAdmin).catch(function (err) { alert(err.message || err); });
     };
-    document.getElementById('schedule-' + v.id).onclick = function () {
-      var date = prompt('Next PMS date for ' + equipmentId(v) + ' (YYYY-MM-DD). Leave blank to return to automatic forecast.', dateValue(scheduleDate(v)));
-      if (date === null) return;
-      if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) { alert('Use the YYYY-MM-DD format.'); return; }
-      setNextPMSDate(v.id, date).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+    document.getElementById('general-' + v.id).onclick = function () {
+      if (!confirm('Mark General Servicing as done for ' + equipmentId(v) + '? This resets only the General Servicing interval.')) return;
+      markServiceDone(v.id, 'general').then(loadAdmin).catch(function (err) { alert(err.message || err); });
     };
+    ['pms', 'general'].forEach(function (service) {
+      document.getElementById('schedule-' + service + '-' + v.id).onclick = function () {
+        var label = service === 'general' ? 'General Servicing' : 'PMS';
+        var date = prompt('Next ' + label + ' date for ' + equipmentId(v) + ' (YYYY-MM-DD). Leave blank to return to automatic forecast.', dateValue(scheduleDate(v, service)));
+        if (date === null) return;
+        if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) { alert('Use the YYYY-MM-DD format.'); return; }
+        setNextServiceDate(v.id, service, date).then(loadAdmin).catch(function (err) { alert(err.message || err); });
+      };
+    });
     document.getElementById('notice-' + v.id).onclick = function () {
       var text = prompt('Notice for ' + equipmentId(v) + ' (e.g. "Called in for brake check"). Leave blank to clear.', v.specialNotice || '');
       if (text === null) return;
@@ -686,25 +777,33 @@ function showEditEquipmentModal(v) {
     '<h2>Edit equipment</h2>' +
     '<label for="edit-equipment-id">Equipment ID</label><input id="edit-equipment-id" value="' + esc(equipmentId(v)) + '">' +
     '<label for="edit-equipment-type">Equipment type</label><input id="edit-equipment-type" value="' + esc(v.equipmentType || v.name || '') + '">' +
-    '<label for="edit-pms-interval">PMS interval (km / SMR)</label><input id="edit-pms-interval" type="number" min="1" value="' + esc(v.pmsIntervalKm) + '">' +
+    '<label for="edit-general-interval">General Servicing interval (km / SMR; PMS is automatically double)</label><input id="edit-general-interval" type="number" min="1" value="' + esc(generalServiceInterval(v)) + '">' +
+    '<label>PMS interval (calculated)</label><input id="edit-pms-interval-preview" type="number" value="' + esc(generalServiceInterval(v) * 2) + '" readonly>' +
     '<label for="edit-last-pms">Last PMS odometer / SMR reading</label><input id="edit-last-pms" type="number" min="0" value="' + esc(v.lastPMSOdometer) + '">' +
+    '<label for="edit-last-general">Last General Servicing odometer / SMR reading</label><input id="edit-last-general" type="number" min="0" value="' + esc(v.lastGeneralServiceOdometer == null ? v.lastPMSOdometer : v.lastGeneralServiceOdometer) + '">' +
     '<label for="edit-current-odo">Current odometer / SMR</label><input id="edit-current-odo" type="number" min="0" value="' + esc(v.currentOdometer) + '">' +
-    '<label for="edit-next-pms-date">Next PMS date (optional; blank uses automatic forecast)</label><input id="edit-next-pms-date" type="date" value="' + esc(dateValue(scheduleDate(v))) + '">' +
+    '<label for="edit-next-pms-date">Next PMS date (optional; blank uses automatic forecast)</label><input id="edit-next-pms-date" type="date" value="' + esc(dateValue(scheduleDate(v, 'pms'))) + '">' +
+    '<label for="edit-next-general-date">Next General Servicing date (optional; blank uses automatic forecast)</label><input id="edit-next-general-date" type="date" value="' + esc(dateValue(scheduleDate(v, 'general'))) + '">' +
     '<div id="edit-equipment-error" class="err"></div>' +
     '<div class="actions"><button id="edit-cancel">Cancel</button><button class="primary" id="edit-save" style="flex:1">Save changes</button></div>' +
     '</div>';
   document.body.appendChild(bg);
   document.getElementById('edit-cancel').onclick = function () { document.body.removeChild(bg); };
   bg.onclick = function (event) { if (event.target === bg) document.body.removeChild(bg); };
+  document.getElementById('edit-general-interval').oninput = function () {
+    document.getElementById('edit-pms-interval-preview').value = (Number(this.value) || 0) * 2;
+  };
   document.getElementById('edit-save').onclick = function () {
     var save = this, error = document.getElementById('edit-equipment-error');
     var values = {
       equipmentId: document.getElementById('edit-equipment-id').value,
       equipmentType: document.getElementById('edit-equipment-type').value,
-      pmsIntervalKm: document.getElementById('edit-pms-interval').value,
+      generalServiceIntervalKm: document.getElementById('edit-general-interval').value,
       lastPMSOdometer: document.getElementById('edit-last-pms').value,
+      lastGeneralServiceOdometer: document.getElementById('edit-last-general').value,
       currentOdometer: document.getElementById('edit-current-odo').value,
-      nextPMSDate: document.getElementById('edit-next-pms-date').value
+      nextPMSDate: document.getElementById('edit-next-pms-date').value,
+      nextGeneralServiceDate: document.getElementById('edit-next-general-date').value
     };
     save.disabled = true; save.textContent = 'Saving…'; error.textContent = '';
     updateVehicleDetails(v.id, values).then(function () {
@@ -720,7 +819,7 @@ function showEditEquipmentModal(v) {
 function renderCalendar(vehicles) {
   var now = new Date(), year = calendarCursor.getFullYear(), month = calendarCursor.getMonth();
   var first = new Date(year, month, 1), days = new Date(year, month + 1, 0).getDate();
-  var html = '<div class="card calendar"><div class="row"><div><button id="calendar-prev" class="ghost" type="button">&larr;</button> <strong>PMS schedule — ' + calendarCursor.toLocaleString(undefined, { month: 'long', year: 'numeric' }) + '</strong> <button id="calendar-next" class="ghost" type="button">&rarr;</button></div><span class="muted">Set an optional Next PMS date when registering equipment</span></div><div class="calendar-head">';
+  var html = '<div class="card calendar"><div class="row"><div><button id="calendar-prev" class="ghost" type="button">&larr;</button> <strong>Service schedule — ' + calendarCursor.toLocaleString(undefined, { month: 'long', year: 'numeric' }) + '</strong> <button id="calendar-next" class="ghost" type="button">&rarr;</button></div><span class="muted">PMS and General Servicing dates</span></div><div class="calendar-head">';
   ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(function (d) { html += '<div>' + d + '</div>'; });
   html += '</div><div class="calendar-grid">';
   for (var i = 0; i < first.getDay(); i++) html += '<div class="calendar-day empty"></div>';
@@ -729,7 +828,11 @@ function renderCalendar(vehicles) {
     var today = key === dateValue(now);
     html += '<div class="calendar-day' + (today ? ' today' : '') + '"><strong>' + day + '</strong>';
     vehicles.forEach(function (v) {
-      if (dateKey(scheduleDate(v)) === key) html += '<span class="event">' + esc(equipmentId(v)) + (v.scheduleMode === 'manual' ? ' (manual)' : '') + '</span>';
+      ['pms', 'general'].forEach(function (service) {
+        if (dateKey(scheduleDate(v, service)) === key) {
+          html += '<span class="event">' + esc(equipmentId(v)) + ' — ' + (service === 'general' ? 'General Servicing' : 'PMS') + '</span>';
+        }
+      });
     });
     html += '</div>';
   }
@@ -750,11 +853,14 @@ function renderEquipmentTypeList(vehicles) {
       html += '<div class="type-group"><div class="type-group-title">' + esc(type) + ' <span class="muted">(' + groups[type].length + ')</span></div>';
       groups[type].sort(function (a, b) { return equipmentId(a).localeCompare(equipmentId(b)); }).forEach(function (v) {
         var p = computeStatus(v);
-        var next = scheduleDate(v);
+        var gs = computeServiceStatus(v, 'general');
+        var nextPMS = scheduleDate(v, 'pms');
+        var nextGeneral = scheduleDate(v, 'general');
         html += '<div class="equipment-row">' +
           '<div><strong>' + esc(equipmentId(v)) + '</strong><small>Odometer/SMR: ' + Number(v.currentOdometer).toLocaleString() + '</small></div>' +
-          '<div><span class="badge ' + p.status + '">' + statusLabel(p.status) + '</span><small>' + p.kmSinceLastPMS.toLocaleString() + ' since last PMS</small></div>' +
-          '<div><strong>' + (next ? esc(dateValue(next)) : 'Not forecast yet') + '</strong><small>' + (v.scheduleMode === 'manual' ? 'Manual override' : 'Automatic forecast') + '</small></div>' +
+          '<div><span class="badge ' + p.status + '">PMS ' + statusLabel(p.status) + '</span><small>' + p.kmSinceLastPMS.toLocaleString() + ' since PMS · interval ' + Number(v.pmsIntervalKm || generalServiceInterval(v) * 2).toLocaleString() + '</small></div>' +
+          '<div><span class="badge ' + gs.status + '">GS ' + statusLabel(gs.status) + '</span><small>' + gs.kmSinceLastPMS.toLocaleString() + ' since General Service · interval ' + generalServiceInterval(v).toLocaleString() + '</small></div>' +
+          '<div><strong>PMS: ' + (nextPMS ? esc(dateValue(nextPMS)) : 'Not forecast yet') + '</strong><small>GS: ' + (nextGeneral ? esc(dateValue(nextGeneral)) : 'Not forecast yet') + '</small></div>' +
           '<button id="list-qr-' + v.id + '" type="button">QR</button>' +
           '</div>';
       });
