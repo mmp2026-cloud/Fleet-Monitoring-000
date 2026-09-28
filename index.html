@@ -86,7 +86,7 @@ import {
   getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
   query, where, orderBy, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
-import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import { getAuth, createUserWithEmailAndPassword, sendEmailVerification, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
 
 // ============================================================
 // FILL THIS IN after creating your Firebase project
@@ -148,10 +148,6 @@ function dateValue(value) {
 function dateKey(value) { return dateValue(value); }
 function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
 function scheduleDate(v) { return v.scheduleMode === 'manual' ? v.nextPMSDate : (v.forecastPMSDate || ''); }
-function adminAuthEmail(username) {
-  if (username.trim().toLowerCase() !== 'dmc_3cloud$!'.toLowerCase()) throw new Error('Hindi tama ang Company ID o password.');
-  return 'dmc_cloud@fleet-monitoring-000.firebaseapp.com';
-}
 function localDateKey(date) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
@@ -299,56 +295,105 @@ onAuthStateChanged(auth, function (user) {
     signOut(auth).catch(renderError);
     return;
   }
+  if (!user.emailVerified) {
+    renderAdminEmailVerification(user);
+    return;
+  }
   renderAdminLoading();
-  user.getIdTokenResult().then(function (tokenResult) {
-    return getDoc(doc(db, 'admins', user.uid)).then(function (adminDoc) {
-      if (!adminDoc.exists() || adminDoc.data().enabled !== true) {
-        renderAdminUnauthorized();
-        return;
-      }
-      loadAdmin();
-    });
+  getDoc(doc(db, 'admins', user.uid)).then(function (adminDoc) {
+    if (!adminDoc.exists() || adminDoc.data().enabled !== true) {
+      renderAdminPendingApproval(user);
+      return;
+    }
+    loadAdmin();
   }).catch(renderError);
 });
 
 function renderAdminLogin(message) {
   app.innerHTML = '<div class="card auth-card"><h1>Fleet PMS Admin</h1>' +
-    '<p class="sub">Mag-sign in gamit ang admin username at password.</p>' +
-    '<form id="admin-login-form"><label for="admin-username">Company ID</label><input id="admin-username" type="text" autocomplete="username" required>' +
-    '<label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required>' +
+    '<p class="sub">Gamitin ang email ng kumpanya. Kailangan munang i-verify at aprubahan ang bawat account.</p>' +
+    '<form id="admin-login-form"><label for="admin-email">Company email</label><input id="admin-email" type="email" autocomplete="username" required>' +
+    '<label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" minlength="8" required>' +
     '<div id="login-error" class="err">' + (message ? esc(message) : '') + '</div>' +
-    '<button class="primary" type="submit" style="width:100%">Sign in</button></form>' +
-    '<p class="muted">Walang public sign-up. Admin accounts lang na pinayagan sa Firebase ang makakapasok.</p></div>';
+    '<div class="actions"><button class="primary" type="submit" style="flex:1">Sign in</button>' +
+    '<button type="button" id="admin-register" style="flex:1">Create account</button></div></form>' +
+    '<p class="muted">Walang Microsoft Entra setup na kailangan. Ang bagong account ay hindi makakapasok hangga’t hindi naaaprubahan.</p></div>';
   document.getElementById('admin-login-form').onsubmit = function (event) {
     event.preventDefault();
-    var username = document.getElementById('admin-username').value;
+    var email = document.getElementById('admin-email').value.trim();
     var password = document.getElementById('admin-password').value;
-    var button = document.querySelector('#admin-login-form button');
+    var button = document.querySelector('#admin-login-form button[type="submit"]');
     var error = document.getElementById('login-error');
     button.disabled = true; button.textContent = 'Signing in…'; error.textContent = '';
-    var email;
-    try { email = adminAuthEmail(username); }
-    catch (err) {
-      error.textContent = err.message;
+    signInWithEmailAndPassword(auth, email, password).catch(function (err) {
+      error.textContent = err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found'
+        ? 'Hindi tama ang email o password.'
+        : err.code === 'auth/operation-not-allowed'
+          ? 'I-enable muna ang Email/Password sa Firebase Authentication.'
+          : 'Hindi makapag-sign in: ' + (err.message || err);
       button.disabled = false; button.textContent = 'Sign in';
+    });
+  };
+  document.getElementById('admin-register').onclick = function () {
+    var email = document.getElementById('admin-email').value.trim();
+    var password = document.getElementById('admin-password').value;
+    var button = this;
+    var error = document.getElementById('login-error');
+    if (!email || !document.getElementById('admin-email').checkValidity()) {
+      error.textContent = 'Ilagay muna ang valid na company email.';
       return;
     }
-    signInWithEmailAndPassword(auth, email, password).catch(function (err) {
-      if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
-        error.textContent = 'Hindi tama ang Company ID o password.';
-      } else if (err.code === 'auth/operation-not-allowed') {
-        error.textContent = 'I-enable muna ang Email/Password sa Firebase Authentication.';
-      } else {
-        error.textContent = 'Hindi makapag-sign in: ' + (err.message || err);
-      }
-      button.disabled = false; button.textContent = 'Sign in';
+    if (password.length < 8) {
+      error.textContent = 'Gumamit ng password na hindi bababa sa 8 characters.';
+      return;
+    }
+    button.disabled = true; button.textContent = 'Creating account…'; error.textContent = '';
+    createUserWithEmailAndPassword(auth, email, password).then(function (credential) {
+      return sendEmailVerification(credential.user).then(function () {
+        renderAdminEmailVerification(credential.user, 'Naipadala ang verification email. I-verify ito bago magpatuloy.');
+      });
+    }).catch(function (err) {
+      error.textContent = err.code === 'auth/email-already-in-use'
+        ? 'May account na gamit ang email na ito. Mag-sign in o mag-reset ng password.'
+        : err.code === 'auth/operation-not-allowed'
+          ? 'I-enable muna ang Email/Password sa Firebase Authentication.'
+          : 'Hindi makagawa ng account: ' + (err.message || err);
+      button.disabled = false; button.textContent = 'Create account';
     });
   };
 }
 
-function renderAdminUnauthorized() {
-  adminLoginMessage = 'Walang admin access ang account na ito. Makipag-ugnayan sa administrator.';
-  signOut(auth).catch(renderError);
+function renderAdminEmailVerification(user, message) {
+  app.innerHTML = '<div class="card auth-card"><h1>I-verify ang email</h1>' +
+    '<p class="sub">Nagpadala kami ng verification link sa <strong>' + esc(user.email) + '</strong>.</p>' +
+    '<p class="muted">' + esc(message || 'Buksan ang email, i-click ang verification link, at pagkatapos ay mag-sign in muli.') + '</p>' +
+    '<div class="actions"><button class="primary" id="resend-verification">Resend email</button><button id="verify-signout">Sign out</button></div>' +
+    '<div id="verify-message" class="muted" role="status"></div></div>';
+  document.getElementById('resend-verification').onclick = function () {
+    var button = this, status = document.getElementById('verify-message');
+    button.disabled = true; status.textContent = '';
+    sendEmailVerification(user).then(function () {
+      status.textContent = 'Naipadala muli ang verification email.';
+      button.disabled = false;
+    }).catch(function (err) {
+      status.textContent = 'Hindi naipadala ang email: ' + (err.message || err);
+      button.disabled = false;
+    });
+  };
+  document.getElementById('verify-signout').onclick = function () {
+    signOut(auth).catch(renderError);
+  };
+}
+
+function renderAdminPendingApproval(user) {
+  app.innerHTML = '<div class="card auth-card"><h1>Naghihintay ng admin approval</h1>' +
+    '<p class="sub">Na-verify ang email na <strong>' + esc(user.email) + '</strong>, pero wala pa itong dashboard access.</p>' +
+    '<p class="muted">Ibigay ang Firebase UID na ito sa administrator para maaprubahan ang account:</p>' +
+    '<p><code>' + esc(user.uid) + '</code></p>' +
+    '<button class="primary" id="approval-signout">Sign out</button></div>';
+  document.getElementById('approval-signout').onclick = function () {
+    signOut(auth).catch(renderError);
+  };
 }
 
 // ============================================================
