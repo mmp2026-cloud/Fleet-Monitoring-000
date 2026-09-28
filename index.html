@@ -309,7 +309,7 @@ onAuthStateChanged(auth, function (user) {
 function renderAdminLogin(message) {
   app.innerHTML = '<div class="card auth-card"><h1>Fleet PMS Admin</h1>' +
     '<p class="sub">Ilagay ang admin access code para buksan ang dashboard.</p>' +
-    '<form id="admin-login-form"><label for="admin-code">Admin access code</label><input id="admin-code" type="password" autocomplete="current-password" minlength="16" required>' +
+    '<form id="admin-login-form"><label for="admin-code">Admin access code</label><input id="admin-code" type="password" autocomplete="current-password" minlength="6" required>' +
     '<div id="login-error" class="err">' + (message ? esc(message) : '') + '</div>' +
     '<button class="primary" type="submit" style="width:100%">Open dashboard</button></form>' +
     '<p class="muted">Ibahagi lamang ang access code sa mga aprubadong admin.</p></div>';
