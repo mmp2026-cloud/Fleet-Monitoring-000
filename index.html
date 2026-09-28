@@ -86,7 +86,7 @@ import {
   getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
   query, where, orderBy, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
-import { getAuth, createUserWithEmailAndPassword, sendEmailVerification, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
 
 // ============================================================
 // FILL THIS IN after creating your Firebase project
@@ -108,6 +108,7 @@ const db = getFirestore(fbApp);
 const auth = getAuth(fbApp);
 
 const DUE_SOON_RATIO = 0.10;
+const ADMIN_AUTH_EMAIL = 'marlon.pagulayan@dmc.nickelasia.com';
 var calendarCursor = new Date();
 const params = new URLSearchParams(window.location.search);
 const VEHICLE_ID = params.get('v') || '';
@@ -295,10 +296,6 @@ onAuthStateChanged(auth, function (user) {
     signOut(auth).catch(renderError);
     return;
   }
-  if (!user.emailVerified) {
-    renderAdminEmailVerification(user);
-    return;
-  }
   renderAdminLoading();
   getDoc(doc(db, 'admins', user.uid)).then(function (adminDoc) {
     if (!adminDoc.exists() || adminDoc.data().enabled !== true) {
@@ -311,84 +308,33 @@ onAuthStateChanged(auth, function (user) {
 
 function renderAdminLogin(message) {
   app.innerHTML = '<div class="card auth-card"><h1>Fleet PMS Admin</h1>' +
-    '<p class="sub">Gamitin ang email ng kumpanya. Kailangan munang i-verify at aprubahan ang bawat account.</p>' +
-    '<form id="admin-login-form"><label for="admin-email">Company email</label><input id="admin-email" type="email" autocomplete="username" required>' +
-    '<label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" minlength="8" required>' +
+    '<p class="sub">Ilagay ang admin access code para buksan ang dashboard.</p>' +
+    '<form id="admin-login-form"><label for="admin-code">Admin access code</label><input id="admin-code" type="password" autocomplete="current-password" minlength="16" required>' +
     '<div id="login-error" class="err">' + (message ? esc(message) : '') + '</div>' +
-    '<div class="actions"><button class="primary" type="submit" style="flex:1">Sign in</button>' +
-    '<button type="button" id="admin-register" style="flex:1">Create account</button></div></form>' +
-    '<p class="muted">Walang Microsoft Entra setup na kailangan. Ang bagong account ay hindi makakapasok hangga’t hindi naaaprubahan.</p></div>';
+    '<button class="primary" type="submit" style="width:100%">Open dashboard</button></form>' +
+    '<p class="muted">Ibahagi lamang ang access code sa mga aprubadong admin.</p></div>';
   document.getElementById('admin-login-form').onsubmit = function (event) {
     event.preventDefault();
-    var email = document.getElementById('admin-email').value.trim();
-    var password = document.getElementById('admin-password').value;
-    var button = document.querySelector('#admin-login-form button[type="submit"]');
+    var code = document.getElementById('admin-code').value;
+    var button = document.querySelector('#admin-login-form button');
     var error = document.getElementById('login-error');
-    button.disabled = true; button.textContent = 'Signing in…'; error.textContent = '';
-    signInWithEmailAndPassword(auth, email, password).catch(function (err) {
-      error.textContent = err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found'
-        ? 'Hindi tama ang email o password.'
-        : err.code === 'auth/operation-not-allowed'
-          ? 'I-enable muna ang Email/Password sa Firebase Authentication.'
-          : 'Hindi makapag-sign in: ' + (err.message || err);
-      button.disabled = false; button.textContent = 'Sign in';
+    button.disabled = true; button.textContent = 'Verifying…'; error.textContent = '';
+    signInWithEmailAndPassword(auth, ADMIN_AUTH_EMAIL, code).catch(function (err) {
+      if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
+        error.textContent = 'Hindi tama ang admin access code.';
+      } else if (err.code === 'auth/operation-not-allowed') {
+        error.textContent = 'I-enable muna ang Email/Password sa Firebase Authentication.';
+      } else {
+        error.textContent = 'Hindi ma-verify ang access code: ' + (err.message || err);
+      }
+      button.disabled = false; button.textContent = 'Open dashboard';
     });
-  };
-  document.getElementById('admin-register').onclick = function () {
-    var email = document.getElementById('admin-email').value.trim();
-    var password = document.getElementById('admin-password').value;
-    var button = this;
-    var error = document.getElementById('login-error');
-    if (!email || !document.getElementById('admin-email').checkValidity()) {
-      error.textContent = 'Ilagay muna ang valid na company email.';
-      return;
-    }
-    if (password.length < 8) {
-      error.textContent = 'Gumamit ng password na hindi bababa sa 8 characters.';
-      return;
-    }
-    button.disabled = true; button.textContent = 'Creating account…'; error.textContent = '';
-    createUserWithEmailAndPassword(auth, email, password).then(function (credential) {
-      return sendEmailVerification(credential.user).then(function () {
-        renderAdminEmailVerification(credential.user, 'Naipadala ang verification email. I-verify ito bago magpatuloy.');
-      });
-    }).catch(function (err) {
-      error.textContent = err.code === 'auth/email-already-in-use'
-        ? 'May account na gamit ang email na ito. Mag-sign in o mag-reset ng password.'
-        : err.code === 'auth/operation-not-allowed'
-          ? 'I-enable muna ang Email/Password sa Firebase Authentication.'
-          : 'Hindi makagawa ng account: ' + (err.message || err);
-      button.disabled = false; button.textContent = 'Create account';
-    });
-  };
-}
-
-function renderAdminEmailVerification(user, message) {
-  app.innerHTML = '<div class="card auth-card"><h1>I-verify ang email</h1>' +
-    '<p class="sub">Nagpadala kami ng verification link sa <strong>' + esc(user.email) + '</strong>.</p>' +
-    '<p class="muted">' + esc(message || 'Buksan ang email, i-click ang verification link, at pagkatapos ay mag-sign in muli.') + '</p>' +
-    '<div class="actions"><button class="primary" id="resend-verification">Resend email</button><button id="verify-signout">Sign out</button></div>' +
-    '<div id="verify-message" class="muted" role="status"></div></div>';
-  document.getElementById('resend-verification').onclick = function () {
-    var button = this, status = document.getElementById('verify-message');
-    button.disabled = true; status.textContent = '';
-    sendEmailVerification(user).then(function () {
-      status.textContent = 'Naipadala muli ang verification email.';
-      button.disabled = false;
-    }).catch(function (err) {
-      status.textContent = 'Hindi naipadala ang email: ' + (err.message || err);
-      button.disabled = false;
-    });
-  };
-  document.getElementById('verify-signout').onclick = function () {
-    signOut(auth).catch(renderError);
   };
 }
 
 function renderAdminPendingApproval(user) {
-  app.innerHTML = '<div class="card auth-card"><h1>Naghihintay ng admin approval</h1>' +
-    '<p class="sub">Na-verify ang email na <strong>' + esc(user.email) + '</strong>, pero wala pa itong dashboard access.</p>' +
-    '<p class="muted">Ibigay ang Firebase UID na ito sa administrator para maaprubahan ang account:</p>' +
+  app.innerHTML = '<div class="card auth-card"><h1>Admin access is not enabled</h1>' +
+    '<p class="sub">The Firebase admin account is not allowlisted for dashboard access.</p>' +
     '<p><code>' + esc(user.uid) + '</code></p>' +
     '<button class="primary" id="approval-signout">Sign out</button></div>';
   document.getElementById('approval-signout').onclick = function () {
