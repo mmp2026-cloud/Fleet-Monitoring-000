@@ -66,14 +66,13 @@
   .calendar-day.today { outline: 2px solid var(--accent); outline-offset: -2px; }
   .calendar-day strong { font-size: 13px; }
   .event { display: block; margin-top: 5px; padding: 3px 5px; border-radius: 5px; background: #dbeafe; color: #1e40af; font-size: 11px; line-height: 1.25; }
-  .file-input { padding: 8px; background: #f9fafb; }
-  .photo-preview { max-width: 100%; max-height: 180px; border-radius: 8px; margin-top: 6px; }
   .setup-note { background: #eff6ff; border-color: #bfdbfe; }
   .type-list { margin-top: 16px; }
   .type-group { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 10px; }
   .type-group-title { background: #f9fafb; padding: 10px 12px; font-weight: 700; }
   .equipment-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap: 10px; align-items: center; padding: 11px 12px; border-top: 1px solid var(--border); }
   .equipment-row small { color: var(--muted); display: block; margin-top: 3px; }
+  .auth-card { max-width: 440px; margin: 48px auto; }
   @media (max-width: 640px) { .equipment-row { grid-template-columns: 1fr 1fr; } .equipment-row .badge { justify-self: start; } }
   @media (max-width: 520px) { body { padding: 10px; } .card { padding: 13px; } }
 </style>
@@ -85,10 +84,9 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
 import {
   getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
-  query, orderBy, limit, serverTimestamp
+  query, where, orderBy, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
-import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
-import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-storage.js";
+import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
 
 // ============================================================
 // FILL THIS IN after creating your Firebase project
@@ -108,7 +106,6 @@ const firebaseConfig = {
 const fbApp = initializeApp(firebaseConfig);
 const db = getFirestore(fbApp);
 const auth = getAuth(fbApp);
-const storage = getStorage(fbApp);
 
 const DUE_SOON_RATIO = 0.10;
 var calendarCursor = new Date();
@@ -151,6 +148,10 @@ function dateValue(value) {
 function dateKey(value) { return dateValue(value); }
 function integrationUrl() { return localStorage.getItem('fleetSheetWebhook') || ''; }
 function scheduleDate(v) { return v.scheduleMode === 'manual' ? v.nextPMSDate : (v.forecastPMSDate || ''); }
+function adminAuthEmail(username) {
+  if (username.trim().toLowerCase() !== 'dmc_cloud') throw new Error('Hindi tama ang username o password.');
+  return 'dmc_cloud@fleet-monitoring-000.firebaseapp.com';
+}
 function localDateKey(date) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
@@ -235,25 +236,14 @@ async function submitReading(vehicleId, odometer, driverName) {
   odometer = Number(odometer);
   var v = await getVehicle(vehicleId);
   var prevOdometer = Number(v.currentOdometer);
-  var logRef = await addDoc(collection(db, 'vehicles', vehicleId, 'logs'), {
+  await addDoc(collection(db, 'vehicles', vehicleId, 'logs'), {
     odometer: odometer, prevOdometer: prevOdometer, timestamp: serverTimestamp(),
-    driverName: driverName || '', photoUrl: '', recalled: false
+    driverName: driverName || '', recalled: false, submittedBy: auth.currentUser.uid
   });
   await updateDoc(doc(db, 'vehicles', vehicleId), {
     currentOdometer: odometer, lastSubmissionAt: serverTimestamp(), lastSubmissionBy: driverName || ''
   });
-  var logs = await listReadingLogs(vehicleId);
-  var forecast = forecastPMSDate(await getVehicle(vehicleId), logs);
-  if (forecast) await updateDoc(doc(db, 'vehicles', vehicleId), { forecastPMSDate: forecast });
-  return { vehicle: await getVehicle(vehicleId), logId: logRef.id };
-}
-async function attachReadingPhoto(vehicleId, logId, file) {
-  var path = 'odometer-proofs/' + vehicleId + '/' + logId + '-' + Date.now() + '-' + file.name.replace(/[^a-z0-9._-]/gi, '_');
-  var storageRef = ref(storage, path);
-  await uploadBytes(storageRef, file, { contentType: file.type });
-  var photoUrl = await getDownloadURL(storageRef);
-  await updateDoc(doc(db, 'vehicles', vehicleId, 'logs', logId), { photoUrl: photoUrl });
-  return photoUrl;
+  return getVehicle(vehicleId);
 }
 async function sendToSheet(payload) {
   var url = integrationUrl();
@@ -262,9 +252,13 @@ async function sendToSheet(payload) {
   if (!response.ok) throw new Error('Sheet sync failed (' + response.status + ').');
 }
 async function recallLastSubmission(vehicleId) {
-  var q = query(collection(db, 'vehicles', vehicleId, 'logs'), orderBy('timestamp', 'desc'), limit(20));
+  var q = query(collection(db, 'vehicles', vehicleId, 'logs'), where('submittedBy', '==', auth.currentUser.uid));
   var snap = await getDocs(q);
-  var target = snap.docs.find(function (d) { return d.data().recalled !== true; });
+  var target = snap.docs.sort(function (a, b) {
+    var aTime = a.data().timestamp.toMillis ? a.data().timestamp.toMillis() : 0;
+    var bTime = b.data().timestamp.toMillis ? b.data().timestamp.toMillis() : 0;
+    return bTime - aTime;
+  }).slice(0, 20).find(function (d) { return d.data().recalled !== true; });
   if (!target) throw new Error('No submission to recall');
   await updateDoc(target.ref, { recalled: true });
   var prevOdo = target.data().prevOdometer;
@@ -275,21 +269,87 @@ async function recallLastSubmission(vehicleId) {
 // ============================================================
 // AUTH + ROUTER
 // ============================================================
-signInAnonymously(auth).catch(function (err) {
-  app.innerHTML = '<div class="card"><p class="err">Could not connect: ' + esc(err.message) + '</p></div>';
-});
+var adminLoginMessage = '';
 onAuthStateChanged(auth, function (user) {
-  if (!user) return;
   if (VEHICLE_ID) {
+    if (user && !user.isAnonymous) {
+      signOut(auth).catch(function (err) {
+        app.innerHTML = '<div class="card"><p class="err">Could not switch to operator access: ' + esc(err.message) + '</p></div>';
+      });
+      return;
+    }
+    if (!user) {
+      signInAnonymously(auth).catch(function (err) {
+        app.innerHTML = '<div class="card"><p class="err">Could not connect: ' + esc(err.message) + '</p></div>';
+      });
+      return;
+    }
     renderDriverLoading();
     getVehicle(VEHICLE_ID).then(function (v) {
       v ? renderDriverForm(v) : renderDriverNotFound();
     }).catch(renderError);
-  } else {
-    renderAdminLoading();
-    loadAdmin();
+    return;
   }
+  if (!user) {
+    renderAdminLogin(adminLoginMessage);
+    adminLoginMessage = '';
+    return;
+  }
+  if (user.isAnonymous) {
+    signOut(auth).catch(renderError);
+    return;
+  }
+  renderAdminLoading();
+  user.getIdTokenResult().then(function (tokenResult) {
+    return getDoc(doc(db, 'admins', user.uid)).then(function (adminDoc) {
+      if (!adminDoc.exists() || adminDoc.data().enabled !== true) {
+        renderAdminUnauthorized();
+        return;
+      }
+      loadAdmin();
+    });
+  }).catch(renderError);
 });
+
+function renderAdminLogin(message) {
+  app.innerHTML = '<div class="card auth-card"><h1>Fleet PMS Admin</h1>' +
+    '<p class="sub">Mag-sign in gamit ang admin username at password.</p>' +
+    '<form id="admin-login-form"><label for="admin-username">Username</label><input id="admin-username" type="text" autocomplete="username" required>' +
+    '<label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required>' +
+    '<div id="login-error" class="err">' + (message ? esc(message) : '') + '</div>' +
+    '<button class="primary" type="submit" style="width:100%">Sign in</button></form>' +
+    '<p class="muted">Walang public sign-up. Admin accounts lang na pinayagan sa Firebase ang makakapasok.</p></div>';
+  document.getElementById('admin-login-form').onsubmit = function (event) {
+    event.preventDefault();
+    var username = document.getElementById('admin-username').value;
+    var password = document.getElementById('admin-password').value;
+    var button = document.querySelector('#admin-login-form button');
+    var error = document.getElementById('login-error');
+    button.disabled = true; button.textContent = 'Signing in…'; error.textContent = '';
+    var email;
+    try { email = adminAuthEmail(username); }
+    catch (err) {
+      error.textContent = err.message;
+      button.disabled = false; button.textContent = 'Sign in';
+      return;
+    }
+    signInWithEmailAndPassword(auth, email, password).catch(function (err) {
+      if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
+        error.textContent = 'Hindi tama ang username o password.';
+      } else if (err.code === 'auth/operation-not-allowed') {
+        error.textContent = 'I-enable muna ang Email/Password sa Firebase Authentication.';
+      } else {
+        error.textContent = 'Hindi makapag-sign in: ' + (err.message || err);
+      }
+      button.disabled = false; button.textContent = 'Sign in';
+    });
+  };
+}
+
+function renderAdminUnauthorized() {
+  adminLoginMessage = 'Walang admin access ang account na ito. Makipag-ugnayan sa administrator.';
+  signOut(auth).catch(renderError);
+}
 
 // ============================================================
 // DRIVER VIEW
@@ -329,9 +389,6 @@ function renderDriverForm(v) {
       '<input type="number" id="odo-input" inputmode="numeric" placeholder="e.g. 45210">' +
       '<label>Driver name (optional)</label>' +
       '<input type="text" id="name-input" placeholder="Your name">' +
-      '<label>Photo of odometer/SMR (required proof)</label>' +
-      '<input class="file-input" type="file" id="photo-input" accept="image/*" capture="environment">' +
-      '<img id="photo-preview" class="photo-preview" style="display:none" alt="Odometer proof preview">' +
       '<div id="form-err" class="err"></div>' +
       '<button class="primary" style="width:100%" id="review-btn">Review &amp; Submit</button>' +
     '</div>';
@@ -339,15 +396,10 @@ function renderDriverForm(v) {
   document.getElementById('review-btn').onclick = function () {
     var odo = document.getElementById('odo-input').value;
     var name = document.getElementById('name-input').value;
-    var photo = document.getElementById('photo-input').files[0];
     var errEl = document.getElementById('form-err');
     errEl.textContent = '';
     if (odo === '' || isNaN(odo) || Number(odo) < 0) {
       errEl.textContent = 'Please enter a valid odometer reading.';
-      return;
-    }
-    if (!photo || !photo.type.startsWith('image/')) {
-      errEl.textContent = 'Please take or select a photo of the odometer/SMR reading.';
       return;
     }
     var warn = '';
@@ -355,16 +407,11 @@ function renderDriverForm(v) {
       warn = '<p class="err">Heads up: this is lower than the last recorded reading (' +
         Number(v.currentOdometer).toLocaleString() + ' km). Double check before submitting.</p>';
     }
-    renderDriverReview(v, Number(odo), name, photo, warn);
-  };
-  document.getElementById('photo-input').onchange = function () {
-    var file = this.files[0], preview = document.getElementById('photo-preview');
-    if (!file) { preview.style.display = 'none'; return; }
-    preview.src = URL.createObjectURL(file); preview.style.display = 'block';
+    renderDriverReview(v, Number(odo), name, warn);
   };
 }
 
-function renderDriverReview(v, odo, name, photo, warn) {
+function renderDriverReview(v, odo, name, warn) {
   app.innerHTML =
     '<h1>' + esc(equipmentLabel(v)) + '</h1>' +
     '<p class="sub">Please review before submitting</p>' +
@@ -372,7 +419,6 @@ function renderDriverReview(v, odo, name, photo, warn) {
       '<div class="muted">Odometer reading</div>' +
       '<div class="big-num">' + odo.toLocaleString() + ' km</div>' +
       (name ? '<div class="muted">Driver: ' + esc(name) + '</div>' : '') +
-      '<div class="muted">Odometer photo attached: ' + esc(photo.name) + '</div>' +
       warn +
     '</div>' +
     '<div class="actions">' +
@@ -384,14 +430,12 @@ function renderDriverReview(v, odo, name, photo, warn) {
   document.getElementById('confirm-btn').onclick = function () {
     var btn = document.getElementById('confirm-btn');
     btn.disabled = true; btn.textContent = 'Submitting…';
-    submitReading(v.id, odo, name).then(function (result) {
-      return attachReadingPhoto(v.id, result.logId, photo).then(function (photoUrl) {
-        return sendToSheet({
-          submittedAt: new Date().toISOString(), equipmentId: equipmentId(v),
-          equipmentType: v.equipmentType || '', operator: name || '',
-          odometerSmr: odo, proofPhotoUrl: photoUrl, source: 'Fleet PMS QR'
-        }).then(function () { return result.vehicle; });
-      });
+    submitReading(v.id, odo, name).then(function (updated) {
+      return sendToSheet({
+        submittedAt: new Date().toISOString(), equipmentId: equipmentId(v),
+        equipmentType: v.equipmentType || '', operator: name || '',
+        odometerSmr: odo, source: 'Fleet PMS QR'
+      }).then(function () { return updated; });
     }).then(function (updated) {
       renderDriverConfirmed(updated);
     }).catch(function (err) {
@@ -451,7 +495,7 @@ function renderAdmin(vehicles) {
   var counts = { OK: 0, DUE_SOON: 0, OVERDUE: 0 };
   vehicles.forEach(function (v) { counts[computeStatus(v).status]++; });
 
-  var html = '<h1>Fleet PMS Dashboard</h1>' +
+  var html = '<div class="row"><div><h1>Fleet PMS Dashboard</h1><p class="muted">' + esc(auth.currentUser.email || '') + '</p></div><button id="admin-signout">Sign out</button></div>' +
     '<p class="sub">' + vehicles.length + ' equipment item(s) — ' +
       '<span class="badge OK">OK ' + counts.OK + '</span> ' +
       '<span class="badge DUE_SOON">Due Soon ' + counts.DUE_SOON + '</span> ' +
@@ -473,7 +517,7 @@ function renderAdmin(vehicles) {
   html += '<div class="card setup-note"><strong>Online sheet sync</strong><p class="muted">Paste a Google Apps Script web-app URL to record every QR submission in Google Sheets. The same webhook pattern can also feed Microsoft Excel via Power Automate.</p>' +
     '<input id="sheet-webhook" placeholder="https://script.google.com/macros/s/.../exec" value="' + esc(integrationUrl()) + '">' +
     '<button id="save-webhook">Save sync URL</button> <span id="webhook-status" class="muted"></span></div>';
-  html += '<div class="card"><strong>Reading log export</strong><p class="muted">Download odometer/SMR submissions as a CSV file. Includes operator, timestamp, previous reading, proof photo link, and recalled status. Open the file in Excel or import it into Google Sheets.</p>' +
+  html += '<div class="card"><strong>Reading log export</strong><p class="muted">Download odometer/SMR submissions as a CSV file. Includes operator, timestamp, previous reading, and recalled status. Open the file in Excel or import it into Google Sheets.</p>' +
     '<label for="export-date">Export date</label><input id="export-date" type="date" value="' + localDateKey(new Date()) + '">' +
     '<div class="actions"><button class="primary" id="export-day">Export selected day</button><button id="export-all">Export all history</button></div>' +
     '<div id="export-status" class="muted" role="status" aria-live="polite"></div></div>';
@@ -513,6 +557,9 @@ function renderAdmin(vehicles) {
 
   app.innerHTML = html;
 
+  document.getElementById('admin-signout').onclick = function () {
+    signOut(auth).catch(function (err) { alert('Could not sign out: ' + (err.message || err)); });
+  };
   document.getElementById('calendar-prev').onclick = function () {
     calendarCursor.setMonth(calendarCursor.getMonth() - 1); renderAdmin(vehicles);
   };
@@ -580,7 +627,7 @@ function renderAdmin(vehicles) {
 async function exportReadingLogs(vehicles, dateFilter) {
   var status = document.getElementById('export-status');
   status.textContent = 'Preparing export…';
-  var rows = [['Timestamp', 'Equipment ID', 'Equipment Type', 'Operator', 'Odometer/SMR Reading', 'Previous Reading', 'Proof Photo URL', 'Recalled']];
+  var rows = [['Timestamp', 'Equipment ID', 'Equipment Type', 'Operator', 'Odometer/SMR Reading', 'Previous Reading', 'Recalled']];
   vehicles.forEach(function (v) {
     (v.readingLogs || []).forEach(function (log) {
       var timestamp = log.timestamp && log.timestamp.toDate ? log.timestamp.toDate() : new Date(log.timestamp);
@@ -588,8 +635,7 @@ async function exportReadingLogs(vehicles, dateFilter) {
       if (dateFilter && localDateKey(timestamp) !== dateFilter) return;
       rows.push([
         timestamp.toISOString(), equipmentId(v), v.equipmentType || v.name || '',
-        log.driverName || '', log.odometer, log.prevOdometer, log.photoUrl || '',
-        log.recalled === true ? 'Yes' : 'No'
+        log.driverName || '', log.odometer, log.prevOdometer, log.recalled === true ? 'Yes' : 'No'
       ]);
     });
   });
