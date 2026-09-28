@@ -210,6 +210,28 @@ async function addVehicle(id, type, pmsIntervalKm, lastPmsOdometer, currentOdome
   });
   return getVehicle(ref.id);
 }
+async function updateVehicleDetails(id, values) {
+  var lastOdo = Number(values.lastPMSOdometer);
+  var currentOdo = Number(values.currentOdometer);
+  var interval = Number(values.pmsIntervalKm);
+  if (!values.equipmentId.trim() || !values.equipmentType.trim()
+      || !Number.isFinite(lastOdo) || lastOdo < 0
+      || !Number.isFinite(currentOdo) || currentOdo < 0
+      || !Number.isFinite(interval) || interval <= 0) {
+    throw new Error('Tiyaking may Equipment ID/type at valid na PMS interval at odometer readings.');
+  }
+  await updateDoc(doc(db, 'vehicles', id), {
+    equipmentId: values.equipmentId.trim(),
+    equipmentType: values.equipmentType.trim(),
+    pmsIntervalKm: interval,
+    lastPMSOdometer: lastOdo,
+    currentOdometer: currentOdo,
+    nextPMSDate: values.nextPMSDate || '',
+    scheduleMode: values.nextPMSDate ? 'manual' : 'auto',
+    forecastPMSDate: ''
+  });
+  return getVehicle(id);
+}
 async function deleteVehicleFn(id) {
   await deleteDoc(doc(db, 'vehicles', id));
 }
@@ -538,6 +560,7 @@ function renderAdmin(vehicles) {
       (v.readingCount ? '<p class="muted" style="margin:2px 0">Historical readings used: ' + v.readingCount + '</p>' : '') +
       '<div class="actions">' +
         '<button id="qr-' + v.id + '">Show QR</button>' +
+        '<button id="edit-' + v.id + '">Edit equipment</button>' +
         '<button id="pms-' + v.id + '">Mark PMS Done</button>' +
         '<button id="schedule-' + v.id + '">Schedule PMS</button>' +
         '<button id="notice-' + v.id + '">Set Notice</button>' +
@@ -593,6 +616,7 @@ function renderAdmin(vehicles) {
   vehicles.forEach(function (v) {
     document.getElementById('qr-' + v.id).onclick = function () { showQrModal(v); };
     document.getElementById('list-qr-' + v.id).onclick = function () { showQrModal(v); };
+    document.getElementById('edit-' + v.id).onclick = function () { showEditEquipmentModal(v); };
     document.getElementById('pms-' + v.id).onclick = function () {
       if (!confirm('Mark PMS as done for ' + equipmentId(v) + '? This resets the interval from the current odometer.')) return;
       markPMSDone(v.id).then(loadAdmin).catch(function (err) { alert(err.message || err); });
@@ -653,6 +677,44 @@ function showQrModal(v) {
   new QRCode(document.getElementById('qr-canvas-holder'), { text: url, width: 200, height: 200 });
   document.getElementById('qr-close').onclick = function () { document.body.removeChild(bg); };
   bg.onclick = function (e) { if (e.target === bg) document.body.removeChild(bg); };
+}
+
+function showEditEquipmentModal(v) {
+  var bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = '<div class="modal" style="max-width:520px;max-height:90vh;overflow:auto;text-align:left">' +
+    '<h2>Edit equipment</h2>' +
+    '<label for="edit-equipment-id">Equipment ID</label><input id="edit-equipment-id" value="' + esc(equipmentId(v)) + '">' +
+    '<label for="edit-equipment-type">Equipment type</label><input id="edit-equipment-type" value="' + esc(v.equipmentType || v.name || '') + '">' +
+    '<label for="edit-pms-interval">PMS interval (km / SMR)</label><input id="edit-pms-interval" type="number" min="1" value="' + esc(v.pmsIntervalKm) + '">' +
+    '<label for="edit-last-pms">Last PMS odometer / SMR reading</label><input id="edit-last-pms" type="number" min="0" value="' + esc(v.lastPMSOdometer) + '">' +
+    '<label for="edit-current-odo">Current odometer / SMR</label><input id="edit-current-odo" type="number" min="0" value="' + esc(v.currentOdometer) + '">' +
+    '<label for="edit-next-pms-date">Next PMS date (optional; blank uses automatic forecast)</label><input id="edit-next-pms-date" type="date" value="' + esc(dateValue(scheduleDate(v))) + '">' +
+    '<div id="edit-equipment-error" class="err"></div>' +
+    '<div class="actions"><button id="edit-cancel">Cancel</button><button class="primary" id="edit-save" style="flex:1">Save changes</button></div>' +
+    '</div>';
+  document.body.appendChild(bg);
+  document.getElementById('edit-cancel').onclick = function () { document.body.removeChild(bg); };
+  bg.onclick = function (event) { if (event.target === bg) document.body.removeChild(bg); };
+  document.getElementById('edit-save').onclick = function () {
+    var save = this, error = document.getElementById('edit-equipment-error');
+    var values = {
+      equipmentId: document.getElementById('edit-equipment-id').value,
+      equipmentType: document.getElementById('edit-equipment-type').value,
+      pmsIntervalKm: document.getElementById('edit-pms-interval').value,
+      lastPMSOdometer: document.getElementById('edit-last-pms').value,
+      currentOdometer: document.getElementById('edit-current-odo').value,
+      nextPMSDate: document.getElementById('edit-next-pms-date').value
+    };
+    save.disabled = true; save.textContent = 'Saving…'; error.textContent = '';
+    updateVehicleDetails(v.id, values).then(function () {
+      document.body.removeChild(bg);
+      loadAdmin();
+    }).catch(function (err) {
+      error.textContent = 'Could not save: ' + (err.message || err);
+      save.disabled = false; save.textContent = 'Save changes';
+    });
+  };
 }
 
 function renderCalendar(vehicles) {
